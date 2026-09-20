@@ -38,7 +38,8 @@ def test_history_scanner_finds_old_secret(tmp_path: Path):
     subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=tmp_path, check=True)
     subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
     p = tmp_path / "config.txt"
-    p.write_text(("pass" + "word") + "=this-is-a-history-secret\n", encoding="utf-8")
+    historical_token = "ghp_" + ("A" * 36)
+    p.write_text(historical_token + "\n", encoding="utf-8")
     subprocess.run(["git", "add", "config.txt"], cwd=tmp_path, check=True)
     subprocess.run(["git", "commit", "-qm", "secret"], cwd=tmp_path, check=True)
     p.write_text("clean=true\n", encoding="utf-8")
@@ -46,4 +47,4 @@ def test_history_scanner_finds_old_secret(tmp_path: Path):
     subprocess.run(["git", "commit", "-qm", "clean"], cwd=tmp_path, check=True)
 
     report = scan_repository(tmp_path, history=True)
-    assert any(f["rule"] == "HARDCODED_CREDENTIAL" for f in report["findings"])
+    assert any(f["rule"] == "GH_TOKEN" for f in report["findings"])
