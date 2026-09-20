@@ -190,6 +190,7 @@ class DexFile:
         self.types: list[str] = []
         self.methods: list[MethodRef] = []
         self.code: dict[int, MethodCode] = {}
+        self.class_supertypes: dict[str, set[str]] = {}
         self._parse()
 
     def _parse(self) -> None:
@@ -245,6 +246,20 @@ class DexFile:
 
         for i in range(class_defs_size):
             off = class_defs_off + i * 32
+            class_idx = _u32(data, off)
+            superclass_idx = _u32(data, off + 8)
+            interfaces_off = _u32(data, off + 12)
+            if class_idx >= len(self.types):
+                raise DexError("class_def class index out of range")
+            owner = self.types[class_idx]
+            parents: set[str] = set()
+            if superclass_idx != 0xFFFFFFFF:
+                if superclass_idx >= len(self.types):
+                    raise DexError("class_def superclass index out of range")
+                parents.add(self.types[superclass_idx])
+            parents.update(_type_list(data, interfaces_off, self.types))
+            self.class_supertypes[owner] = parents
+
             class_data_off = _u32(data, off + 24)
             if class_data_off:
                 self._parse_class_data(class_data_off)
@@ -369,6 +384,240 @@ def _shortest_paths(
     return sorted(dedup.values(), key=lambda x: (x["sink"], x["depth"], x["path"]))
 
 
+
+def _method_parts(full_name: str) -> tuple[str, str, str]:
+    owner, rest = full_name.split("->", 1)
+    name, descriptor_tail = rest.split("(", 1)
+    return owner, name, "(" + descriptor_tail
+
+
+def _is_subtype(
+    candidate: str,
+    target: str,
+    supertypes: dict[str, set[str]],
+    cache: dict[tuple[str, str], bool],
+) -> bool:
+    key = (candidate, target)
+    if key in cache:
+        return cache[key]
+    if candidate == target:
+        cache[key] = True
+        return True
+    seen: set[str] = set()
+    stack = list(supertypes.get(candidate, ()))
+    while stack:
+        parent = stack.pop()
+        if parent == target:
+            cache[key] = True
+            return True
+        if parent in seen:
+            continue
+        seen.add(parent)
+        stack.extend(supertypes.get(parent, ()))
+    cache[key] = False
+    return False
+
+
+def _add_polymorphic_edges(
+    graph: dict[str, set[str]],
+    code_methods: set[str],
+    supertypes: dict[str, set[str]],
+    *,
+    max_candidates_per_signature: int = 64,
+) -> int:
+    implementations: dict[tuple[str, str], list[str]] = {}
+    for full in code_methods:
+        _, name, descriptor = _method_parts(full)
+        implementations.setdefault((name, descriptor), []).append(full)
+
+    cache: dict[tuple[str, str], bool] = {}
+    added = 0
+    callees = {callee for values in graph.values() for callee in values}
+    for callee in sorted(callees):
+        target_owner, name, descriptor = _method_parts(callee)
+        if target_owner not in supertypes:
+            continue
+        candidates = implementations.get((name, descriptor), ())
+        if len(candidates) > max_candidates_per_signature:
+            continue
+        for implementation in candidates:
+            impl_owner, _, _ = _method_parts(implementation)
+            if impl_owner == target_owner:
+                continue
+            if _is_subtype(impl_owner, target_owner, supertypes, cache):
+                graph.setdefault(callee, set()).add(implementation)
+                added += 1
+    return added
+
+
+def _signed16(value: int) -> int:
+    return value - 0x10000 if value & 0x8000 else value
+
+
+def _invoke_registers(units: list[int], index: int, opcode: int) -> list[int]:
+    if 0x6E <= opcode <= 0x72 or opcode in {0xFA}:
+        first = units[index]
+        count = (first >> 12) & 0xF
+        g = (first >> 8) & 0xF
+        packed = units[index + 2] if index + 2 < len(units) else 0
+        regs = [
+            packed & 0xF,
+            (packed >> 4) & 0xF,
+            (packed >> 8) & 0xF,
+            (packed >> 12) & 0xF,
+            g,
+        ]
+        return regs[:count]
+    if 0x74 <= opcode <= 0x78 or opcode in {0xFB}:
+        count = (units[index] >> 8) & 0xFF
+        start = units[index + 2] if index + 2 < len(units) else 0
+        return list(range(start, start + count))
+    return []
+
+
+def _decode_dispatch_records(dex: DexFile, code: MethodCode) -> list[dict]:
+    insns_size = _u32(dex.data, code.code_off + 12)
+    insns_off = code.code_off + 16
+    units = list(struct.unpack_from(f"<{insns_size}H", dex.data, insns_off)) if insns_size else []
+    records: list[dict] = []
+    i = 0
+    while i < len(units):
+        opcode = units[i] & 0xFF
+        width = _instruction_width(units, i)
+        if width <= 0 or i + width > len(units):
+            break
+        record: dict = {"offset": i, "opcode": opcode, "width": width}
+
+        if opcode == 0x1A and i + 1 < len(units):
+            record.update(kind="const-string", register=(units[i] >> 8) & 0xFF, string_index=units[i + 1])
+        elif opcode == 0x1B and i + 2 < len(units):
+            record.update(
+                kind="const-string",
+                register=(units[i] >> 8) & 0xFF,
+                string_index=units[i + 1] | (units[i + 2] << 16),
+            )
+        elif opcode == 0x22 and i + 1 < len(units):
+            type_index = units[i + 1]
+            if type_index < len(dex.types):
+                record.update(kind="new-instance", register=(units[i] >> 8) & 0xFF, type=dex.types[type_index])
+        elif opcode in {0x0A, 0x0B, 0x0C}:
+            record.update(kind="move-result", register=(units[i] >> 8) & 0xFF)
+        elif opcode in {0x38, 0x39} and i + 1 < len(units):
+            record.update(
+                kind="if-testz",
+                register=(units[i] >> 8) & 0xFF,
+                condition="eqz" if opcode == 0x38 else "nez",
+                target=i + _signed16(units[i + 1]),
+            )
+        elif (0x6E <= opcode <= 0x72) or (0x74 <= opcode <= 0x78) or opcode in {0xFA, 0xFB}:
+            if i + 1 < len(units):
+                method_index = units[i + 1]
+                if method_index < len(dex.methods):
+                    record.update(
+                        kind="invoke",
+                        method=dex.methods[method_index].full_name,
+                        registers=_invoke_registers(units, i, opcode),
+                    )
+        records.append(record)
+        i += width
+    return records
+
+
+def _discover_dispatches_in_method(dex: DexFile, code: MethodCode) -> list[dict]:
+    records = _decode_dispatch_records(dex, code)
+    command_names = {command.lower(): command for command in COMMAND_HINTS}
+    discoveries: list[dict] = []
+
+    for pos, record in enumerate(records):
+        if record.get("kind") != "const-string":
+            continue
+        string_index = record.get("string_index")
+        if not isinstance(string_index, int) or string_index >= len(dex.strings):
+            continue
+        raw_value = dex.strings[string_index]
+        command = command_names.get(raw_value.lower())
+        if not command:
+            continue
+        command_reg = record["register"]
+
+        invoke_pos = None
+        for j in range(pos + 1, min(len(records), pos + 10)):
+            candidate = records[j]
+            if candidate.get("kind") != "invoke":
+                continue
+            method = candidate.get("method", "")
+            regs = candidate.get("registers", [])
+            if (
+                (method.startswith("Ljava/lang/String;->equals(") or
+                 method.startswith("Ljava/lang/String;->equalsIgnoreCase("))
+                and command_reg in regs
+            ):
+                invoke_pos = j
+                break
+        if invoke_pos is None:
+            continue
+
+        move_pos = invoke_pos + 1
+        if move_pos >= len(records) or records[move_pos].get("kind") != "move-result":
+            continue
+        result_reg = records[move_pos]["register"]
+
+        branch_pos = move_pos + 1
+        if branch_pos >= len(records):
+            continue
+        branch = records[branch_pos]
+        if branch.get("kind") != "if-testz" or branch.get("register") != result_reg:
+            continue
+
+        success_start = branch["offset"] + branch["width"]
+        success_end = branch["target"] if branch["condition"] == "eqz" else None
+        task_types: list[str] = []
+
+        if success_end is not None and success_end > success_start:
+            for candidate in records:
+                if not (success_start <= candidate["offset"] < success_end):
+                    continue
+                if candidate.get("kind") == "new-instance":
+                    type_name = candidate.get("type")
+                    if isinstance(type_name, str):
+                        task_types.append(type_name)
+
+        discoveries.append({
+            "command": command,
+            "dispatcher": code.method.full_name,
+            "comparison": records[invoke_pos]["method"],
+            "branch_condition": branch["condition"],
+            "branch_target_code_unit": branch["target"],
+            "task_types": sorted(set(task_types)),
+            "confidence": "high" if task_types else "partial",
+            "evidence_note": (
+                "command const-string feeds String.equals; matching branch contains concrete new-instance"
+                if task_types else
+                "command comparison identified, but concrete task construction was not resolved"
+            ),
+        })
+    return discoveries
+
+
+def _discover_task_dispatches(dexes: list[DexFile]) -> list[dict]:
+    discoveries: list[dict] = []
+    for dex in dexes:
+        for code in dex.code.values():
+            discoveries.extend(_discover_dispatches_in_method(dex, code))
+
+    unique: dict[tuple, dict] = {}
+    for item in discoveries:
+        key = (
+            item["command"],
+            item["dispatcher"],
+            tuple(item["task_types"]),
+            item["branch_target_code_unit"],
+        )
+        unique[key] = item
+    return sorted(unique.values(), key=lambda x: (x["command"], x["dispatcher"], x["task_types"]))
+
+
+
 def trace_apk(
     apk_path: str | Path,
     *,
@@ -396,8 +645,11 @@ def trace_apk(
     graph: dict[str, set[str]] = {}
     code_records: list[tuple[DexFile, MethodCode]] = []
     unique_method_refs: set[str] = set()
+    supertypes: dict[str, set[str]] = {}
 
     for dex in dexes:
+        for owner, parents in dex.class_supertypes.items():
+            supertypes.setdefault(owner, set()).update(parents)
         unique_method_refs.update(method.full_name for method in dex.methods)
         for local_idx, code in dex.code.items():
             caller = code.method.full_name
@@ -406,6 +658,13 @@ def trace_apk(
                 if callee_idx < len(dex.methods):
                     graph[caller].add(dex.methods[callee_idx].full_name)
             code_records.append((dex, code))
+
+    polymorphic_edges_added = _add_polymorphic_edges(
+        graph,
+        {code.method.full_name for _, code in code_records},
+        supertypes,
+    )
+    task_dispatches = _discover_task_dispatches(dexes)
 
     command_seeds: dict[str, set[str]] = {cmd: set() for cmd in COMMAND_HINTS}
     for _, code in code_records:
@@ -425,6 +684,23 @@ def trace_apk(
                 ),
                 "sink_paths": _shortest_paths(seed, graph, max_depth),
             })
+
+    task_execute_paths: list[dict] = []
+    code_method_names = {code.method.full_name for _, code in code_records}
+    for dispatch in task_dispatches:
+        for task_type in dispatch["task_types"]:
+            execute_candidates = sorted(
+                full for full in code_method_names
+                if full.startswith(task_type + "->execute(") or full.startswith(task_type + "->run(")
+            )
+            for execute_method in execute_candidates:
+                task_execute_paths.append({
+                    "command": dispatch["command"],
+                    "dispatcher": dispatch["dispatcher"],
+                    "task_type": task_type,
+                    "entry_method": execute_method,
+                    "sink_paths": _shortest_paths(execute_method, graph, max_depth),
+                })
 
     sink_callers: list[dict] = []
     for caller, callees in graph.items():
@@ -448,13 +724,18 @@ def trace_apk(
         "method_reference_count": sum(len(d.methods) for d in dexes),
         "unique_method_signature_count": len(unique_method_refs),
         "methods_with_code_count": len(code_records),
+        "polymorphic_edges_added": polymorphic_edges_added,
         "first_party_prefixes": list(first_party_prefixes),
         "evidence_semantics": {
             "call_edge": "STATIC_CONFIRMED invocation reference; does not prove runtime execution",
             "command_seed": "method contains an exact const-string command identifier",
             "sink_path": "shortest static invoke path from command-seed method to privileged sink",
             "cross_dex": "method references are canonicalized by full Dalvik signature across DEX files",
+            "polymorphic_dispatch": "known app class/interface relationships add synthetic static dispatch edges",
+            "task_dispatch": "high-confidence mappings require const-string -> String.equals -> matching branch -> concrete new-instance",
         },
+        "task_dispatches": task_dispatches,
+        "task_execute_paths": task_execute_paths,
         "command_paths": command_paths,
         "sink_callers": sorted(sink_callers, key=lambda x: (x["sink"], x["caller"])),
     }
