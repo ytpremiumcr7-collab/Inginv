@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .apk import dump_json, extract_strings, summarize
+from .axml import manifest_matrix, write_component_csv
 from .repo_guard import dump_guard_json, scan_repository
 
 
@@ -28,6 +29,11 @@ def main(argv: list[str] | None = None) -> int:
     strings.add_argument("apk", type=Path)
     strings.add_argument("--json", dest="output")
 
+    manifest = sub.add_parser("manifest-matrix", help="Decode AndroidManifest.xml and emit component/permission model")
+    manifest.add_argument("apk", type=Path)
+    manifest.add_argument("--json", dest="output")
+    manifest.add_argument("--csv", dest="csv_output")
+
     guard = sub.add_parser("repo-guard", help="Scan tracked files and optional Git history for secrets/private evidence")
     guard.add_argument("root", nargs="?", default=".", type=Path)
     guard.add_argument("--history", action="store_true")
@@ -39,6 +45,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "apk-strings":
         _write_or_print(extract_strings(args.apk), args.output)
+        return 0
+    if args.command == "manifest-matrix":
+        model = manifest_matrix(args.apk)
+        _write_or_print(model, args.output)
+        if args.csv_output:
+            write_component_csv(model, args.csv_output)
+            print(f"wrote {args.csv_output}")
         return 0
     if args.command == "repo-guard":
         report = scan_repository(args.root, history=args.history)
