@@ -31,7 +31,7 @@ CREDENTIAL_ASSIGNMENT_RE = re.compile(
 SERIAL_RE = re.compile(r"(?i)\bro\.serialno\b\s*[:=]\s*\S+")
 SSID_RE = re.compile(r'(?i)\bSSID\s*[:=]\s*"[^"]+"')
 BSSID_RE = re.compile(r"(?i)\bBSSID\s*[:=]\s*(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b")
-SAFE_MARKERS = ("<redacted>", "redacted", "example", "dummy", "placeholder", "not-a-real", "changeme", "your_", "your-", "\${", "{{")
+SAFE_MARKERS = ("<redacted>", "redacted", "example", "dummy", "placeholder", "not-a-real", "changeme", "your_", "your-", "${", "{{")
 
 
 @dataclass(frozen=True)
