@@ -52,22 +52,26 @@ def _safe_example(value: str) -> bool:
     return any(marker in lowered for marker in SAFE_MARKERS)
 
 
-def scan_text(path: str, text: str) -> list[GuardFinding]:
+def scan_text_high_confidence(path: str, text: str) -> list[GuardFinding]:
+    """Patterns safe to apply to immutable history with a very low false-positive rate."""
     findings: list[GuardFinding] = []
     private_key_marker = "-----BEGIN " + "PRIVATE KEY-----"
-
     if private_key_marker in text:
         findings.append(GuardFinding(
             "PRIVATE_KEY", "critical", path,
             _line(text, text.index(private_key_marker)),
             private_key_marker,
         ))
-
     for rule, severity, pattern in TOKEN_RULES:
         for match in pattern.finditer(text):
             findings.append(GuardFinding(
                 rule, severity, path, _line(text, match.start()), "<REDACTED_TOKEN>"
             ))
+    return findings
+
+
+def scan_text(path: str, text: str) -> list[GuardFinding]:
+    findings = scan_text_high_confidence(path, text)
 
     for match in CREDENTIAL_ASSIGNMENT_RE.finditer(text):
         value = match.group(2)
@@ -150,7 +154,7 @@ def scan_history(root: Path, max_blob_bytes: int = 2 * 1024 * 1024) -> list[Guar
         ).stdout
         if _looks_binary(raw):
             continue
-        findings.extend(scan_text(f"{path}@{oid[:12]}", raw.decode("utf-8", "replace")))
+        findings.extend(scan_text_high_confidence(f"{path}@{oid[:12]}", raw.decode("utf-8", "replace")))
         if Path(path).suffix.lower() in FORBIDDEN_SUFFIXES or FORBIDDEN_BASENAME_RE.search(Path(path).name):
             findings.append(GuardFinding(
                 "FORBIDDEN_EVIDENCE_ARTIFACT_HISTORY", "critical",
