@@ -8,6 +8,7 @@ from .apk import dump_json, extract_strings, summarize
 from .axml import manifest_matrix, write_component_csv
 from .dex import trace_apk
 from .repo_guard import dump_guard_json, scan_repository
+from .runtime import collect_runtime, correlate_static_runtime, dump_runtime_json
 
 
 def _write_or_print(data: dict, output: str | None) -> None:
@@ -47,6 +48,20 @@ def main(argv: list[str] | None = None) -> int:
     dex.add_argument("--max-depth", type=int, default=12)
     dex.add_argument("--json", dest="output")
 
+    runtime = sub.add_parser("runtime-collect", help="Collect bounded read-only ADB evidence with privacy redaction")
+    runtime.add_argument("package")
+    runtime.add_argument("--adb", default="adb")
+    runtime.add_argument("--serial")
+    runtime.add_argument("--include-network", action="store_true")
+    runtime.add_argument("--logcat-lines", type=int, default=0)
+    runtime.add_argument("--json", dest="output")
+
+    correlate = sub.add_parser("correlate", help="Correlate sanitized runtime evidence with static manifest/DEX reports")
+    correlate.add_argument("runtime_json", type=Path)
+    correlate.add_argument("--manifest-json", type=Path)
+    correlate.add_argument("--dex-json", type=Path)
+    correlate.add_argument("--json", dest="output")
+
     guard = sub.add_parser("repo-guard", help="Scan tracked files and optional Git history for secrets/private evidence")
     guard.add_argument("root", nargs="?", default=".", type=Path)
     guard.add_argument("--history", action="store_true")
@@ -72,6 +87,41 @@ def main(argv: list[str] | None = None) -> int:
             trace_apk(args.apk, first_party_prefixes=prefixes, max_depth=args.max_depth),
             args.output,
         )
+        return 0
+    if args.command == "runtime-collect":
+        bundle = collect_runtime(
+            args.package,
+            adb_path=args.adb,
+            serial=args.serial,
+            include_network=args.include_network,
+            logcat_lines=args.logcat_lines,
+        )
+        if args.output:
+            dump_runtime_json(bundle, args.output)
+            print(f"wrote {args.output}")
+        else:
+            print(json.dumps(bundle, indent=2, sort_keys=True))
+        return 0
+    if args.command == "correlate":
+        runtime_bundle = json.loads(args.runtime_json.read_text(encoding="utf-8"))
+        manifest_model = (
+            json.loads(args.manifest_json.read_text(encoding="utf-8"))
+            if args.manifest_json else None
+        )
+        dex_trace = (
+            json.loads(args.dex_json.read_text(encoding="utf-8"))
+            if args.dex_json else None
+        )
+        report = correlate_static_runtime(
+            runtime_bundle=runtime_bundle,
+            manifest_model=manifest_model,
+            dex_trace=dex_trace,
+        )
+        if args.output:
+            dump_runtime_json(report, args.output)
+            print(f"wrote {args.output}")
+        else:
+            print(json.dumps(report, indent=2, sort_keys=True))
         return 0
     if args.command == "repo-guard":
         report = scan_repository(args.root, history=args.history)
