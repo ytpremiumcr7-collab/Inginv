@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .apk import dump_json, extract_strings, summarize
+from .axml import manifest_matrix, write_component_csv
 
 
 def _write_or_print(data: dict, output: str | None) -> None:
@@ -27,12 +28,24 @@ def main(argv: list[str] | None = None) -> int:
     strings.add_argument("apk", type=Path)
     strings.add_argument("--json", dest="output")
 
+    manifest = sub.add_parser("manifest-matrix", help="Decode AndroidManifest.xml and emit component/permission model")
+    manifest.add_argument("apk", type=Path)
+    manifest.add_argument("--json", dest="output")
+    manifest.add_argument("--csv", dest="csv_output")
+
     args = parser.parse_args(argv)
     if args.command == "apk-summary":
         _write_or_print(summarize(args.apk), args.output)
         return 0
     if args.command == "apk-strings":
         _write_or_print(extract_strings(args.apk), args.output)
+        return 0
+    if args.command == "manifest-matrix":
+        model = manifest_matrix(args.apk)
+        _write_or_print(model, args.output)
+        if args.csv_output:
+            write_component_csv(model, args.csv_output)
+            print(f"wrote {args.csv_output}")
         return 0
     return 2
 
