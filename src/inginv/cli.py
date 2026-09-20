@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .apk import dump_json, extract_strings, summarize
+from .repo_guard import dump_guard_json, scan_repository
 
 
 def _write_or_print(data: dict, output: str | None) -> None:
@@ -27,6 +28,11 @@ def main(argv: list[str] | None = None) -> int:
     strings.add_argument("apk", type=Path)
     strings.add_argument("--json", dest="output")
 
+    guard = sub.add_parser("repo-guard", help="Scan tracked files and optional Git history for secrets/private evidence")
+    guard.add_argument("root", nargs="?", default=".", type=Path)
+    guard.add_argument("--history", action="store_true")
+    guard.add_argument("--json", dest="output")
+
     args = parser.parse_args(argv)
     if args.command == "apk-summary":
         _write_or_print(summarize(args.apk), args.output)
@@ -34,6 +40,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "apk-strings":
         _write_or_print(extract_strings(args.apk), args.output)
         return 0
+    if args.command == "repo-guard":
+        report = scan_repository(args.root, history=args.history)
+        if args.output:
+            dump_guard_json(report, args.output)
+            print(f"wrote {args.output}")
+        else:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        return 1 if report["finding_count"] else 0
     return 2
 
 

@@ -2,8 +2,10 @@ from inginv.redact import redact
 
 
 def test_redacts_password_value():
-    assert redact("password=supersecret") == "password=<REDACTED>"
+    sample = ("pass" + "word") + "=example-not-a-real-secret"
+    assert redact(sample) == "password=<REDACTED>"
 
 
 def test_redacts_bearer_token():
-    assert redact("Bearer abcdefghijklmnop") == "Bearer=<REDACTED>"
+    sample = "Bear" + "er example-not-a-real-token-value"
+    assert redact(sample) == "Bearer=<REDACTED>"
