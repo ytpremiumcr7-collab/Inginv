@@ -133,13 +133,13 @@ def _instruction_width(units: list[int], index: int) -> int:
     }:
         return 1
     if opcode in {
-        0x02,0x05,0x08,0x13,0x15,0x16,0x19,0x1a,0x1c,0x1f,0x20,0x22,0x23,
+        0x02,0x05,0x08,0x13,0x15,0x16,0x19,0x1a,0x1c,0x1f,0x20,0x22,0x23,0x29,
         *range(0x2d,0x3e), *range(0x44,0x6e), *range(0x90,0xb0),
         *range(0xd0,0xe3), 0xfe, 0xff,
     }:
         return 2
     if opcode in {
-        0x03,0x06,0x09,0x14,0x17,0x1b,0x24,0x25,0x26,0x29,0x2a,0x2b,0x2c,
+        0x03,0x06,0x09,0x14,0x17,0x1b,0x24,0x25,0x26,0x2a,0x2b,0x2c,
         *range(0x6e,0x73), *range(0x74,0x79), 0xfc, 0xfd,
     }:
         return 3
@@ -315,38 +315,58 @@ def _sink(method: MethodRef) -> str | None:
     return None
 
 
+def _sink_full(full_name: str) -> str | None:
+    for sink_id, prefix in SINK_PATTERNS:
+        if full_name.startswith(prefix):
+            return sink_id
+    return None
+
+
+def _owner_from_full_name(full_name: str) -> str:
+    return full_name.split("->", 1)[0]
+
+
 def _shortest_paths(
-    seed: int,
-    graph: dict[int, set[int]],
-    methods: dict[int, MethodRef],
+    seed: str,
+    graph: dict[str, set[str]],
     max_depth: int,
 ) -> list[dict]:
-    queue: list[tuple[int, list[int]]] = [(seed, [seed])]
-    visited = {seed}
+    queue: list[tuple[str, list[str]]] = [(seed, [seed])]
+    best_depth: dict[str, int] = {seed: 0}
     results: list[dict] = []
+
     while queue:
         current, path = queue.pop(0)
-        if len(path) - 1 >= max_depth:
+        depth = len(path) - 1
+        if depth >= max_depth:
             continue
+
         for nxt in sorted(graph.get(current, ())):
             if nxt in path:
                 continue
             next_path = path + [nxt]
-            method = methods.get(nxt)
-            if method is None:
-                continue
-            sink_id = _sink(method)
+            sink_id = _sink_full(nxt)
             if sink_id:
                 results.append({
                     "sink": sink_id,
-                    "path": [methods[i].full_name for i in next_path if i in methods],
+                    "path": next_path,
                     "depth": len(next_path) - 1,
                 })
                 continue
-            if nxt not in visited:
-                visited.add(nxt)
+
+            next_depth = len(next_path) - 1
+            if next_depth < best_depth.get(nxt, max_depth + 1):
+                best_depth[nxt] = next_depth
                 queue.append((nxt, next_path))
-    return results
+
+    # Keep only the shortest path per (sink, terminal method).
+    dedup: dict[tuple[str, str], dict] = {}
+    for item in results:
+        key = (item["sink"], item["path"][-1])
+        previous = dedup.get(key)
+        if previous is None or item["depth"] < previous["depth"]:
+            dedup[key] = item
+    return sorted(dedup.values(), key=lambda x: (x["sink"], x["depth"], x["path"]))
 
 
 def trace_apk(
@@ -356,6 +376,9 @@ def trace_apk(
     max_depth: int = 12,
 ) -> dict:
     apk = Path(apk_path)
+    if max_depth < 1 or max_depth > 64:
+        raise ValueError("max_depth must be between 1 and 64")
+
     dexes: list[DexFile] = []
     with zipfile.ZipFile(apk) as zf:
         dex_names = sorted(
@@ -367,82 +390,72 @@ def trace_apk(
         for name in dex_names:
             dexes.append(DexFile(zf.read(name), name))
 
-    # Method indices are local to each DEX. Use (dex_name, index) as global identity.
-    global_methods: dict[int, MethodRef] = {}
-    graph: dict[int, set[int]] = {}
-    code_by_global: dict[int, MethodCode] = {}
-    dex_offsets: dict[str, int] = {}
-    next_base = 0
+    # DEX method indexes are local to each file. Canonicalize by full Dalvik
+    # signature so a call reference in classes.dex can connect to an
+    # implementation that lives in classes2.dex.
+    graph: dict[str, set[str]] = {}
+    code_records: list[tuple[DexFile, MethodCode]] = []
+    unique_method_refs: set[str] = set()
 
     for dex in dexes:
-        base = next_base
-        dex_offsets[dex.name] = base
-        for method in dex.methods:
-            global_methods[base + method.index] = MethodRef(
-                base + method.index, method.owner, method.name, method.descriptor
-            )
+        unique_method_refs.update(method.full_name for method in dex.methods)
         for local_idx, code in dex.code.items():
-            gid = base + local_idx
-            translated = MethodCode(
-                global_methods[gid],
-                code.code_off,
-                set(code.strings),
-                {base + callee for callee in code.calls},
-            )
-            code_by_global[gid] = translated
-            graph[gid] = set(translated.calls)
-        next_base += len(dex.methods) + 1
+            caller = code.method.full_name
+            graph.setdefault(caller, set())
+            for callee_idx in code.calls:
+                if callee_idx < len(dex.methods):
+                    graph[caller].add(dex.methods[callee_idx].full_name)
+            code_records.append((dex, code))
 
-    command_seeds: dict[str, set[int]] = {cmd: set() for cmd in COMMAND_HINTS}
-    for gid, code in code_by_global.items():
-        lowered = {s.lower() for s in code.strings}
+    command_seeds: dict[str, set[str]] = {cmd: set() for cmd in COMMAND_HINTS}
+    for _, code in code_records:
+        exact_lower = {value.lower() for value in code.strings}
         for command in COMMAND_HINTS:
-            if command.lower() in lowered:
-                command_seeds[command].add(gid)
+            if command.lower() in exact_lower:
+                command_seeds[command].add(code.method.full_name)
 
     command_paths: list[dict] = []
     for command in sorted(command_seeds):
         for seed in sorted(command_seeds[command]):
-            paths = _shortest_paths(seed, graph, global_methods, max_depth)
             command_paths.append({
                 "command": command,
-                "seed_method": global_methods[seed].full_name,
+                "seed_method": seed,
                 "seed_owner_classification": _classify_owner(
-                    global_methods[seed].owner, first_party_prefixes
+                    _owner_from_full_name(seed), first_party_prefixes
                 ),
-                "sink_paths": paths,
+                "sink_paths": _shortest_paths(seed, graph, max_depth),
             })
 
     sink_callers: list[dict] = []
     for caller, callees in graph.items():
         for callee in callees:
-            method = global_methods.get(callee)
-            caller_method = global_methods.get(caller)
-            if not method or not caller_method:
+            sink_id = _sink_full(callee)
+            if not sink_id:
                 continue
-            sink_id = _sink(method)
-            if sink_id:
-                sink_callers.append({
-                    "sink": sink_id,
-                    "caller": caller_method.full_name,
-                    "caller_owner_classification": _classify_owner(
-                        caller_method.owner, first_party_prefixes
-                    ),
-                    "callee": method.full_name,
-                })
+            sink_callers.append({
+                "sink": sink_id,
+                "caller": caller,
+                "caller_owner_classification": _classify_owner(
+                    _owner_from_full_name(caller), first_party_prefixes
+                ),
+                "callee": callee,
+            })
 
     return {
         "apk_sha256": file_sha256(apk),
         "dex_count": len(dexes),
         "dex_files": [d.name for d in dexes],
-        "method_reference_count": len(global_methods),
-        "methods_with_code_count": len(code_by_global),
+        "method_reference_count": sum(len(d.methods) for d in dexes),
+        "unique_method_signature_count": len(unique_method_refs),
+        "methods_with_code_count": len(code_records),
         "first_party_prefixes": list(first_party_prefixes),
         "evidence_semantics": {
             "call_edge": "STATIC_CONFIRMED invocation reference; does not prove runtime execution",
             "command_seed": "method contains an exact const-string command identifier",
             "sink_path": "shortest static invoke path from command-seed method to privileged sink",
+            "cross_dex": "method references are canonicalized by full Dalvik signature across DEX files",
         },
         "command_paths": command_paths,
         "sink_callers": sorted(sink_callers, key=lambda x: (x["sink"], x["caller"])),
     }
+
