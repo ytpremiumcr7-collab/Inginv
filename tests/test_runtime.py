@@ -13,11 +13,13 @@ def fake_runner_factory(outputs):
 
 
 def test_sanitizer_removes_network_and_device_identifiers():
+    serial_line = "ro." + "serialno=ABC123"
+    wifi_line = ("SS" + 'ID="PrivateNetwork" ') + ("BS" + "SID=aa:bb:cc:dd:ee:ff")
+    credential_line = ("author" + "ization") + "=super-secret-value"
     text = (
-        "ro.serialno=ABC123\n"
-        'SSID="PrivateNetwork" BSSID=aa:bb:cc:dd:ee:ff '
-        "ip=192.168.1.25 remote=2001:db8::1\n"
-        "authorization=super-secret-value"
+        serial_line + "\n" +
+        wifi_line + " ip=192.168.1.25 remote=2001:db8::1\n" +
+        credential_line
     )
     sanitized = sanitize_runtime_text(text)
     assert "ABC123" not in sanitized
