@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .apk import dump_json, extract_strings, summarize
+from .dex import trace_apk
 
 
 def _write_or_print(data: dict, output: str | None) -> None:
@@ -13,6 +14,13 @@ def _write_or_print(data: dict, output: str | None) -> None:
         print(f"wrote {output}")
     else:
         print(json.dumps(data, indent=2, sort_keys=True))
+
+
+def _descriptor_prefix(value: str) -> str:
+    if value.startswith("L"):
+        return value
+    dotted = value.replace(".", "/")
+    return "L" + dotted
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -27,12 +35,25 @@ def main(argv: list[str] | None = None) -> int:
     strings.add_argument("apk", type=Path)
     strings.add_argument("--json", dest="output")
 
+    dex = sub.add_parser("dex-trace", help="Trace command const-strings through DEX invoke edges to privileged sinks")
+    dex.add_argument("apk", type=Path)
+    dex.add_argument("--first-party-prefix", action="append", default=[])
+    dex.add_argument("--max-depth", type=int, default=12)
+    dex.add_argument("--json", dest="output")
+
     args = parser.parse_args(argv)
     if args.command == "apk-summary":
         _write_or_print(summarize(args.apk), args.output)
         return 0
     if args.command == "apk-strings":
         _write_or_print(extract_strings(args.apk), args.output)
+        return 0
+    if args.command == "dex-trace":
+        prefixes = tuple(_descriptor_prefix(p) for p in args.first_party_prefix)
+        _write_or_print(
+            trace_apk(args.apk, first_party_prefixes=prefixes, max_depth=args.max_depth),
+            args.output,
+        )
         return 0
     return 2
 
