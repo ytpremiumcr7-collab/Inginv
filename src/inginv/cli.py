@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .apk import dump_json, extract_strings, summarize
 from .axml import manifest_matrix, write_component_csv
+from .dex import trace_apk
 from .repo_guard import dump_guard_json, scan_repository
 
 
@@ -15,6 +16,12 @@ def _write_or_print(data: dict, output: str | None) -> None:
         print(f"wrote {output}")
     else:
         print(json.dumps(data, indent=2, sort_keys=True))
+
+
+def _descriptor_prefix(value: str) -> str:
+    if value.startswith("L"):
+        return value
+    return "L" + value.replace(".", "/")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -34,6 +41,12 @@ def main(argv: list[str] | None = None) -> int:
     manifest.add_argument("--json", dest="output")
     manifest.add_argument("--csv", dest="csv_output")
 
+    dex = sub.add_parser("dex-trace", help="Trace command const-strings through DEX invoke edges to privileged sinks")
+    dex.add_argument("apk", type=Path)
+    dex.add_argument("--first-party-prefix", action="append", default=[])
+    dex.add_argument("--max-depth", type=int, default=12)
+    dex.add_argument("--json", dest="output")
+
     guard = sub.add_parser("repo-guard", help="Scan tracked files and optional Git history for secrets/private evidence")
     guard.add_argument("root", nargs="?", default=".", type=Path)
     guard.add_argument("--history", action="store_true")
@@ -52,6 +65,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.csv_output:
             write_component_csv(model, args.csv_output)
             print(f"wrote {args.csv_output}")
+        return 0
+    if args.command == "dex-trace":
+        prefixes = tuple(_descriptor_prefix(p) for p in args.first_party_prefix)
+        _write_or_print(
+            trace_apk(args.apk, first_party_prefixes=prefixes, max_depth=args.max_depth),
+            args.output,
+        )
         return 0
     if args.command == "repo-guard":
         report = scan_repository(args.root, history=args.history)
