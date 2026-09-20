@@ -144,6 +144,9 @@ class AdbCollector:
             stderr = exc.stderr or b""
             out_text, out_truncated = _bounded_decode(stdout)
             err_text, err_truncated = _bounded_decode(stderr)
+            if self.serial:
+                out_text = out_text.replace(self.serial, "<ADB_SERIAL_REDACTED>")
+                err_text = err_text.replace(self.serial, "<ADB_SERIAL_REDACTED>")
             return CommandResult(
                 name=name,
                 argv=list(logical_argv),
@@ -157,6 +160,9 @@ class AdbCollector:
 
         stdout, out_truncated = _bounded_decode(stdout_raw)
         stderr, err_truncated = _bounded_decode(stderr_raw)
+        if self.serial:
+            stdout = stdout.replace(self.serial, "<ADB_SERIAL_REDACTED>")
+            stderr = stderr.replace(self.serial, "<ADB_SERIAL_REDACTED>")
         return CommandResult(
             name=name,
             argv=list(logical_argv),
