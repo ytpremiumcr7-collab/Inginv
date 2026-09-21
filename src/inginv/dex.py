@@ -694,10 +694,87 @@ def _decode_dispatch_records(dex: DexFile, code: MethodCode) -> list[dict]:
     return records
 
 
-def _discover_dispatches_in_method(dex: DexFile, code: MethodCode) -> list[dict]:
+def _record_by_offset(records: list[dict]) -> dict[int, dict]:
+    return {record["offset"]: record for record in records}
+
+
+def _find_const_assignment(
+    records_by_offset: dict[int, dict],
+    start_offset: int,
+    *,
+    max_steps: int = 8,
+) -> tuple[int, int] | None:
+    """Follow a tiny straight-line/goto block to find the case discriminator."""
+    offset = start_offset
+    seen: set[int] = set()
+    for _ in range(max_steps):
+        if offset in seen:
+            return None
+        seen.add(offset)
+        record = records_by_offset.get(offset)
+        if record is None:
+            return None
+        if record.get("kind") == "const-int":
+            return int(record["register"]), int(record["value"])
+        if record.get("kind") == "goto":
+            offset = int(record["target"])
+            continue
+        if record.get("kind") in {"invoke", "move-result", "move", "const-string"}:
+            offset = record["offset"] + record["width"]
+            continue
+        return None
+    return None
+
+
+def _case_new_instances(
+    records_by_offset: dict[int, dict],
+    start_offset: int,
+    case_targets: set[int],
+    executable_owners: set[str],
+    *,
+    max_steps: int = 24,
+) -> list[str]:
+    task_types: list[str] = []
+    offset = start_offset
+    seen: set[int] = set()
+    for _ in range(max_steps):
+        if offset in seen:
+            break
+        seen.add(offset)
+        if offset != start_offset and offset in case_targets:
+            break
+        record = records_by_offset.get(offset)
+        if record is None:
+            break
+        kind = record.get("kind")
+        if kind == "new-instance":
+            type_name = record.get("type")
+            if isinstance(type_name, str) and type_name in executable_owners:
+                task_types.append(type_name)
+        if kind == "goto":
+            break
+        offset = record["offset"] + record["width"]
+    return sorted(set(task_types))
+
+
+def _discover_dispatches_in_method(
+    dex: DexFile,
+    code: MethodCode,
+    executable_owners: set[str] | None = None,
+) -> list[dict]:
     records = _decode_dispatch_records(dex, code)
+    by_offset = _record_by_offset(records)
     command_names = {command.lower(): command for command in COMMAND_HINTS}
     discoveries: list[dict] = []
+    filter_executable_types = executable_owners is not None
+    if executable_owners is None:
+        executable_owners = {
+            method.owner
+            for method in dex.methods
+            if method.name in {"execute", "run"}
+        }
+
+    switches = [record for record in records if record.get("kind") == "switch"]
 
     for pos, record in enumerate(records):
         if record.get("kind") != "const-string":
@@ -740,41 +817,84 @@ def _discover_dispatches_in_method(dex: DexFile, code: MethodCode) -> list[dict]
         if branch.get("kind") != "if-testz" or branch.get("register") != result_reg:
             continue
 
-        success_start = branch["offset"] + branch["width"]
-        success_end = branch["target"] if branch["condition"] == "eqz" else None
+        success_start = (
+            int(branch["target"])
+            if branch["condition"] == "nez"
+            else int(branch["offset"] + branch["width"])
+        )
+        assignment = _find_const_assignment(by_offset, success_start)
         task_types: list[str] = []
+        discriminator: int | None = None
+        discriminator_register: int | None = None
+        switch_kind: str | None = None
+        switch_offset: int | None = None
 
-        if success_end is not None and success_end > success_start:
+        if assignment is not None:
+            discriminator_register, discriminator = assignment
+            candidate_switches = [
+                switch for switch in switches
+                if switch["offset"] > success_start
+                and switch.get("register") == discriminator_register
+                and discriminator in switch.get("cases", {})
+            ]
+            if candidate_switches:
+                second_switch = min(candidate_switches, key=lambda item: item["offset"])
+                switch_kind = str(second_switch.get("switch_kind"))
+                switch_offset = int(second_switch["offset"])
+                target = int(second_switch["cases"][discriminator])
+                case_targets = {int(value) for value in second_switch.get("cases", {}).values()}
+                task_types = _case_new_instances(
+                    by_offset, target, case_targets, executable_owners
+                )
+
+        if not task_types and assignment is None and branch["condition"] == "eqz":
+            success_end = int(branch["target"])
             for candidate in records:
                 if not (success_start <= candidate["offset"] < success_end):
                     continue
                 if candidate.get("kind") == "new-instance":
                     type_name = candidate.get("type")
-                    if isinstance(type_name, str):
+                    if isinstance(type_name, str) and (
+                        not filter_executable_types or type_name in executable_owners
+                    ):
                         task_types.append(type_name)
 
+        confidence = "high" if task_types else "partial"
+        note = (
+            "command equals branch assigns a discriminator consumed by a second switch whose case constructs a concrete executable task"
+            if task_types and discriminator is not None and switch_offset is not None
+            else "command const-string feeds String.equals; matching branch contains concrete executable new-instance"
+            if task_types
+            else "command comparison identified, but concrete executable task construction was not resolved"
+        )
         discoveries.append({
             "command": command,
             "dispatcher": code.method.full_name,
             "comparison": records[invoke_pos]["method"],
             "branch_condition": branch["condition"],
             "branch_target_code_unit": branch["target"],
+            "discriminator_register": discriminator_register,
+            "discriminator": discriminator,
+            "second_switch_kind": switch_kind,
+            "second_switch_code_unit": switch_offset,
             "task_types": sorted(set(task_types)),
-            "confidence": "high" if task_types else "partial",
-            "evidence_note": (
-                "command const-string feeds String.equals; matching branch contains concrete new-instance"
-                if task_types else
-                "command comparison identified, but concrete task construction was not resolved"
-            ),
+            "confidence": confidence,
+            "evidence_note": note,
         })
     return discoveries
 
 
 def _discover_task_dispatches(dexes: list[DexFile]) -> list[dict]:
+    executable_owners = {
+        method.owner
+        for dex in dexes
+        for method in dex.methods
+        if method.name in {"execute", "run"}
+    }
     discoveries: list[dict] = []
     for dex in dexes:
         for code in dex.code.values():
-            discoveries.extend(_discover_dispatches_in_method(dex, code))
+            discoveries.extend(_discover_dispatches_in_method(dex, code, executable_owners))
 
     unique: dict[tuple, dict] = {}
     for item in discoveries:
@@ -783,6 +903,7 @@ def _discover_task_dispatches(dexes: list[DexFile]) -> list[dict]:
             item["dispatcher"],
             tuple(item["task_types"]),
             item["branch_target_code_unit"],
+            item.get("discriminator"),
         )
         unique[key] = item
     return sorted(unique.values(), key=lambda x: (x["command"], x["dispatcher"], x["task_types"]))
