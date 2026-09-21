@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "note": "Reviewed synthetic test-fixture findings only. Entries are pinned to immutable Git blob IDs; changing a file invalidates the baseline automatically.",
+  "entries": [
+    {
+      "path": "tests/test_apk.py",
+      "blob": "61bb506b0b06",
+      "rule": "HARDCODED_CREDENTIAL",
+      "line": 34
+    },
+    {
+      "path": "tests/test_apk.py",
+      "blob": "61bb506b0b06",
+      "rule": "HARDCODED_CREDENTIAL",
+      "line": 35
+    },
+    {
+      "path": "tests/test_apk.py",
+      "blob": "ca835edab1d4",
+      "rule": "HARDCODED_CREDENTIAL",
+      "line": 31
+    },
+    {
+      "path": "tests/test_apk.py",
+      "blob": "ca835edab1d4",
+      "rule": "HARDCODED_CREDENTIAL",
+      "line": 32
+    },
+    {
+      "path": "tests/test_apk.py",
+      "blob": "ca835edab1d4",
+      "rule": "HARDCODED_CREDENTIAL",
+      "line": 34
+    },
+    {
+      "path": "tests/test_apk.py",
+      "blob": "ca835edab1d4",
+      "rule": "HARDCODED_CREDENTIAL",
+      "line": 35
+    },
+    {
+      "path": "tests/test_redact.py",
+      "blob": "a34d8ce19084",
+      "rule": "HARDCODED_CREDENTIAL",
+      "line": 5
+    },
+    {
+      "path": "tests/test_repo_guard.py",
+      "blob": "e660c09c530a",
+      "rule": "HARDCODED_CREDENTIAL",
+      "line": 16
+    },
+    {
+      "path": "tests/test_repo_guard.py",
+      "blob": "e660c09c530a",
+      "rule": "DEVICE_SERIAL",
+      "line": 27
+    },
+    {
+      "path": "tests/test_runtime.py",
+      "blob": "809129f937b4",
+      "rule": "DEVICE_SERIAL",
+      "line": 17
+    },
+    {
+      "path": "tests/test_runtime.py",
+      "blob": "809129f937b4",
+      "rule": "WIFI_BSSID",
+      "line": 18
+    },
+    {
+      "path": "tests/test_runtime.py",
+      "blob": "809129f937b4",
+      "rule": "WIFI_SSID",
+      "line": 18
+    },
+    {
+      "path": "tests/test_runtime.py",
+      "blob": "809129f937b4",
+      "rule": "HARDCODED_CREDENTIAL",
+      "line": 20
+    }
+  ]
+}
