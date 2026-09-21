@@ -9,7 +9,7 @@ import struct
 import xml.etree.ElementTree as ET
 import zipfile
 
-from .apk import validate_apk_archive
+from .apk import file_sha256, validate_apk_archive
 
 RES_STRING_POOL_TYPE = 0x0001
 RES_XML_TYPE = 0x0003
@@ -420,7 +420,9 @@ def manifest_matrix(apk_path: str | Path) -> dict:
         if info.file_size > 8 * 1024 * 1024:
             raise AxmlError("AndroidManifest.xml exceeds analysis budget")
         data = zf.read(info)
-    return build_manifest_model(parse_manifest_bytes(data))
+    model = build_manifest_model(parse_manifest_bytes(data))
+    model["apk_sha256"] = file_sha256(Path(apk_path))
+    return model
 
 
 def write_component_csv(model: dict, path: str | Path) -> None:
