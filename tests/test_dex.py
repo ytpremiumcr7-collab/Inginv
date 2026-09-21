@@ -261,3 +261,40 @@ def test_scheduler_does_not_assume_run_method_means_runnable():
     )
     assert not edges
     assert not graph[caller.full_name]
+
+
+
+def test_sink_path_marks_polymorphic_hop_as_partial():
+    from inginv.dex import _shortest_paths
+
+    seed = "Lapp/Task;->execute()V"
+    interface = "Lapp/Listener;->done()V"
+    implementation = "Lapp/ConcreteListener;->done()V"
+    sink = "Ljava/io/File;->delete()Z"
+    graph = {
+        seed: {interface},
+        interface: {implementation},
+        implementation: {sink},
+    }
+    edge_kinds = {
+        (seed, interface): "invoke",
+        (interface, implementation): "polymorphic",
+        (implementation, sink): "invoke",
+    }
+    paths = _shortest_paths(seed, graph, 4, edge_kinds)
+    assert paths[0]["confidence"] == "partial"
+    assert paths[0]["ambiguous_edges"] == [
+        {"from": interface, "to": implementation, "kind": "polymorphic"}
+    ]
+
+
+def test_sink_path_without_synthetic_dispatch_is_high_confidence():
+    from inginv.dex import _shortest_paths
+
+    seed = "Lapp/Task;->execute()V"
+    sink = "Ljava/io/File;->delete()Z"
+    paths = _shortest_paths(
+        seed, {seed: {sink}}, 2, {(seed, sink): "invoke"}
+    )
+    assert paths[0]["confidence"] == "high"
+    assert paths[0]["ambiguous_edges"] == []
