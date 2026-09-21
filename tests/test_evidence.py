@@ -10,14 +10,14 @@ from inginv.evidence import (
 APK_HASH = "a" * 64
 
 
-def test_finding_id_is_stable_across_severity_changes():
+def test_finding_id_is_stable_across_title_and_severity_changes():
     ref = EvidenceRef(
         source="dex-method",
         locator="dex-method:Lapp/Task;->execute()V",
         artifact_sha256=APK_HASH,
     )
     common = dict(
-        title="Capability path",
+        rule_id="android.privileged_command_path",
         category="android.privileged-capability",
         evidence_state="STATIC_CONFIRMED",
         confidence="high",
@@ -26,8 +26,8 @@ def test_finding_id_is_stable_across_severity_changes():
         remediation="Verify authorization and runtime evidence separately.",
         evidence=(ref,),
     )
-    low = make_finding(severity="informational", **common)
-    high = make_finding(severity="high", **common)
+    low = make_finding(title="Capability path", severity="informational", **common)
+    high = make_finding(title="Reworded capability path", severity="high", **common)
     assert low.finding_id == high.finding_id
 
 
@@ -83,6 +83,7 @@ def test_dex_adapter_emits_method_level_provenance():
 def test_report_markdown_is_deterministic_for_fixed_timestamp():
     ref = EvidenceRef(source="runtime", locator="runtime-record:test")
     finding = make_finding(
+        rule_id="test.report",
         title="Report test",
         category="test",
         evidence_state="RUNTIME_CONFIRMED",
@@ -113,3 +114,29 @@ def test_correlation_adapter_preserves_capture_id():
     findings = findings_from_analysis(correlation=correlation)
     assert findings[0].evidence[0].capture_id == "capture-123"
     assert findings[0].evidence_state == "CORRELATED"
+
+
+def test_markdown_escapes_untrusted_html_and_code_delimiters():
+    ref = EvidenceRef(
+        source="runtime<source>",
+        locator="record:`tick`<script>alert(1)</script>",
+    )
+    finding = make_finding(
+        rule_id="test.markdown_escape",
+        title="Title <img src=x onerror=alert(1)>",
+        category="test",
+        evidence_state="RUNTIME_CONFIRMED",
+        severity="informational",
+        confidence="high",
+        consequence="Untrusted <b>content</b> must render as text.",
+        does_not_prove="Nothing beyond rendering behavior.",
+        remediation="Escape Markdown-visible evidence.",
+        evidence=(ref,),
+    )
+    markdown = report_markdown(
+        build_report([finding], generated_at="2026-09-20T00:00:00+00:00")
+    )
+    assert "<script>" not in markdown
+    assert "<img" not in markdown
+    assert "&lt;script&gt;" in markdown
+    assert "\\`tick\\`" in markdown
