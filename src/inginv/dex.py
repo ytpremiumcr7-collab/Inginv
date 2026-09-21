@@ -5,7 +5,7 @@ from pathlib import Path
 import struct
 import zipfile
 
-from .apk import COMMAND_HINTS, file_sha256
+from .apk import COMMAND_HINTS, MAX_ENTRY_UNCOMPRESSED, file_sha256, validate_apk_archive
 
 
 class DexError(ValueError):
@@ -630,14 +630,24 @@ def trace_apk(
 
     dexes: list[DexFile] = []
     with zipfile.ZipFile(apk) as zf:
-        dex_names = sorted(
-            name for name in zf.namelist()
-            if Path(name).name == "classes.dex" or (
-                Path(name).name.startswith("classes") and Path(name).name.endswith(".dex")
-            )
+        infos = validate_apk_archive(zf)
+        dex_infos = sorted(
+            (
+                zi for zi in infos
+                if Path(zi.filename).name == "classes.dex" or (
+                    Path(zi.filename).name.startswith("classes")
+                    and Path(zi.filename).name.endswith(".dex")
+                )
+            ),
+            key=lambda zi: zi.filename,
         )
-        for name in dex_names:
-            dexes.append(DexFile(zf.read(name), name))
+        dex_total = sum(zi.file_size for zi in dex_infos)
+        if dex_total > 512 * 1024 * 1024:
+            raise DexError(f"DEX payload exceeds analysis budget: {dex_total} bytes")
+        for zi in dex_infos:
+            if zi.file_size > MAX_ENTRY_UNCOMPRESSED:
+                raise DexError(f"{zi.filename}: DEX exceeds per-entry budget")
+            dexes.append(DexFile(zf.read(zi), zi.filename))
 
     # DEX method indexes are local to each file. Canonicalize by full Dalvik
     # signature so a call reference in classes.dex can connect to an
