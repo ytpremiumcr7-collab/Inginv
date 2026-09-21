@@ -16,3 +16,6 @@ def block_network_during_tests(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(socket, "create_connection", blocked)
     monkeypatch.setattr(socket.socket, "connect", blocked)
     monkeypatch.setattr(socket.socket, "connect_ex", blocked)
+    monkeypatch.setattr(socket.socket, "sendto", blocked)
+    if hasattr(socket.socket, "sendmsg"):
+        monkeypatch.setattr(socket.socket, "sendmsg", blocked)
