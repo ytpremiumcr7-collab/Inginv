@@ -93,14 +93,17 @@ def test_device_owner_parser_does_not_match_target_elsewhere_in_dump():
         (
             "dumpsys device_policy",
             (
-                "Current Device Policy Manager state:\n"
-                "  Device Owner:\n"
-                f"    admin=ComponentInfo{{{other}/.Admin}}\n"
-                f"    package={other}\n"
-                "  Enabled Device Admins (User 0):\n"
-                f"    {package}/.Admin:\n"
-            ).encode(),
-            b"",
+                0,
+                (
+                    "Current Device Policy Manager state:\n"
+                    "  Device Owner:\n"
+                    f"    admin=ComponentInfo{{{other}/.Admin}}\n"
+                    f"    package={other}\n"
+                    "  Enabled Device Admins (User 0):\n"
+                    f"    {package}/.Admin:\n"
+                ).encode(),
+                b"",
+            ),
         ),
     ]
     bundle = collect_runtime(package, runner=fake_runner_factory(outputs))
@@ -128,10 +131,13 @@ def test_alarm_output_is_package_scoped():
         (
             "dumpsys alarm",
             (
-                f"alarm target={package}/.Receiver\n"
-                f"alarm target={unrelated}/.Receiver private_payload=should-not-survive\n"
-            ).encode(),
-            b"",
+                0,
+                (
+                    f"alarm target={package}/.Receiver\n"
+                    f"alarm target={unrelated}/.Receiver private_payload=should-not-survive\n"
+                ).encode(),
+                b"",
+            ),
         ),
     ]
     bundle = collect_runtime(package, runner=fake_runner_factory(outputs))
