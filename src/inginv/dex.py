@@ -345,6 +345,7 @@ def _shortest_paths(
     seed: str,
     graph: dict[str, set[str]],
     max_depth: int,
+    edge_kinds: dict[tuple[str, str], str] | None = None,
 ) -> list[dict]:
     queue: list[tuple[str, list[str]]] = [(seed, [seed])]
     best_depth: dict[str, int] = {seed: 0}
@@ -362,10 +363,22 @@ def _shortest_paths(
             next_path = path + [nxt]
             sink_id = _sink_full(nxt)
             if sink_id:
+                kinds = [
+                    (edge_kinds or {}).get((next_path[k], next_path[k + 1]), "invoke")
+                    for k in range(len(next_path) - 1)
+                ]
+                ambiguous = [
+                    {"from": next_path[k], "to": next_path[k + 1], "kind": kinds[k]}
+                    for k in range(len(kinds))
+                    if kinds[k] == "polymorphic"
+                ]
                 results.append({
                     "sink": sink_id,
                     "path": next_path,
                     "depth": len(next_path) - 1,
+                    "edge_kinds": kinds,
+                    "confidence": "partial" if ambiguous else "high",
+                    "ambiguous_edges": ambiguous,
                 })
                 continue
 
@@ -424,6 +437,7 @@ def _add_polymorphic_edges(
     supertypes: dict[str, set[str]],
     *,
     max_candidates_per_signature: int = 64,
+    edge_kinds: dict[tuple[str, str], str] | None = None,
 ) -> int:
     implementations: dict[tuple[str, str], list[str]] = {}
     for full in code_methods:
@@ -446,6 +460,8 @@ def _add_polymorphic_edges(
                 continue
             if _is_subtype(impl_owner, target_owner, supertypes, cache):
                 graph.setdefault(callee, set()).add(implementation)
+                if edge_kinds is not None:
+                    edge_kinds[(callee, implementation)] = "polymorphic"
                 added += 1
     return added
 
@@ -496,6 +512,7 @@ def _add_runnable_dispatch_edges(
     code_records: list[tuple[DexFile, MethodCode]],
     code_methods: set[str],
     supertypes: dict[str, set[str]],
+    edge_kinds: dict[tuple[str, str], str] | None = None,
 ) -> list[dict]:
     """Resolve concrete Runnable objects handed to scheduling APIs.
 
@@ -531,6 +548,8 @@ def _add_runnable_dispatch_edges(
                 if run_method in graph.setdefault(caller, set()):
                     continue
                 graph[caller].add(run_method)
+                if edge_kinds is not None:
+                    edge_kinds[(caller, run_method)] = "concrete-runnable"
                 edges.append({
                     "caller": caller,
                     "scheduler": record.get("method"),
@@ -869,6 +888,15 @@ def _discover_task_dispatches(dexes: list[DexFile]) -> list[dict]:
             item["branch_target_code_unit"],
         )
         unique[key] = item
+
+    command_counts: dict[str, set[str]] = {}
+    for item in unique.values():
+        command_counts.setdefault(item["dispatcher"], set()).add(item["command"])
+    for item in unique.values():
+        count = len(command_counts.get(item["dispatcher"], ()))
+        item["dispatcher_command_count"] = count
+        item["dispatcher_confidence"] = "high" if count >= 2 else "lead"
+
     return sorted(unique.values(), key=lambda x: (x["command"], x["dispatcher"], x["task_types"]))
 
 
@@ -908,6 +936,7 @@ def trace_apk(
     # signature so a call reference in classes.dex can connect to an
     # implementation that lives in classes2.dex.
     graph: dict[str, set[str]] = {}
+    edge_kinds: dict[tuple[str, str], str] = {}
     code_records: list[tuple[DexFile, MethodCode]] = []
     unique_method_refs: set[str] = set()
     supertypes: dict[str, set[str]] = {}
@@ -921,7 +950,9 @@ def trace_apk(
             graph.setdefault(caller, set())
             for callee_idx in code.calls:
                 if callee_idx < len(dex.methods):
-                    graph[caller].add(dex.methods[callee_idx].full_name)
+                    callee = dex.methods[callee_idx].full_name
+                    graph[caller].add(callee)
+                    edge_kinds[(caller, callee)] = "invoke"
             code_records.append((dex, code))
 
     code_method_names = {code.method.full_name for _, code in code_records}
@@ -929,9 +960,10 @@ def trace_apk(
         graph,
         code_method_names,
         supertypes,
+        edge_kinds=edge_kinds,
     )
     runnable_dispatch_edges = _add_runnable_dispatch_edges(
-        graph, code_records, code_method_names, supertypes
+        graph, code_records, code_method_names, supertypes, edge_kinds
     )
     task_dispatches = _discover_task_dispatches(dexes)
 
@@ -951,23 +983,36 @@ def trace_apk(
                 "seed_owner_classification": _classify_owner(
                     _owner_from_full_name(seed), first_party_prefixes
                 ),
-                "sink_paths": _shortest_paths(seed, graph, max_depth),
+                "sink_paths": _shortest_paths(seed, graph, max_depth, edge_kinds),
             })
 
     task_execute_paths: list[dict] = []
+    task_dispatch_leads: list[dict] = []
     for dispatch in task_dispatches:
+        if dispatch.get("dispatcher_confidence") != "high":
+            if dispatch.get("task_types"):
+                task_dispatch_leads.append(dispatch)
+            continue
         for task_type in dispatch["task_types"]:
             execute_candidates = sorted(
                 full for full in code_method_names
-                if full.startswith(task_type + "->execute(") or full.startswith(task_type + "->run(")
+                if full.startswith(task_type + "->execute(")
             )
+            if not execute_candidates:
+                task_dispatch_leads.append({
+                    **dispatch,
+                    "lead_reason": "resolved allocation has no concrete execute() implementation",
+                })
+                continue
             for execute_method in execute_candidates:
                 task_execute_paths.append({
                     "command": dispatch["command"],
                     "dispatcher": dispatch["dispatcher"],
                     "task_type": task_type,
                     "entry_method": execute_method,
-                    "sink_paths": _shortest_paths(execute_method, graph, max_depth),
+                    "sink_paths": _shortest_paths(
+                        execute_method, graph, max_depth, edge_kinds
+                    ),
                 })
 
     sink_callers: list[dict] = []
@@ -1001,12 +1046,13 @@ def trace_apk(
             "command_seed": "method contains an exact const-string command identifier",
             "sink_path": "shortest static invoke path from command-seed method to privileged sink",
             "cross_dex": "method references are canonicalized by full Dalvik signature across DEX files",
-            "polymorphic_dispatch": "known app class/interface relationships add synthetic static dispatch edges",
+            "polymorphic_dispatch": "known app class/interface relationships add synthetic static dispatch edges and are explicitly marked partial when present in a sink path",
             "runnable_dispatch": "concrete same-method Runnable allocation passed to a scheduling API adds a static edge to that concrete run() implementation",
             "task_dispatch": "high-confidence mappings resolve either a direct equals branch or a two-stage Java/D8 string-switch to a concrete new-instance",
         },
         "task_dispatches": task_dispatches,
         "task_execute_paths": task_execute_paths,
+        "task_dispatch_leads": task_dispatch_leads,
         "command_paths": command_paths,
         "sink_callers": sorted(sink_callers, key=lambda x: (x["sink"], x["caller"])),
     }
