@@ -96,7 +96,7 @@ def summarize(path: str | Path) -> dict:
                           if e.kind == "native-library" and len(PurePosixPath(e.name).parts) > 2})
 
     return {
-        "path": str(apk),
+        "path": apk.name,
         "size": apk.stat().st_size,
         "sha256": file_sha256(apk),
         "zip_integrity": "ok" if corrupt is None else f"corrupt:{corrupt}",
@@ -120,7 +120,7 @@ def extract_strings(path: str | Path, *, max_per_entry: int = 10000) -> dict:
                 continue
             data = zf.read(zi)
             for raw in URL_RE.findall(data):
-                urls.add(redact(raw.decode("utf-8", "replace")))
+                urls.add(_safe_url(raw.decode("utf-8", "replace")))
             seen = 0
             for raw in ASCII_RE.findall(data):
                 text = raw.decode("ascii", "replace")
@@ -129,9 +129,21 @@ def extract_strings(path: str | Path, *, max_per_entry: int = 10000) -> dict:
                     break
                 hits = sorted(h for h in COMMAND_HINTS if h.lower() in text.lower())
                 if hits:
-                    command_hits.append({"entry": zi.filename, "value": redact(text[:500]), "commands": hits})
-                if CREDENTIAL_HINT_RE.search(text):
-                    credential_hints.append({"entry": zi.filename, "value": redact(text[:500])})
+                    command_hits.append({
+                        "entry": zi.filename,
+                        "commands": hits,
+                        "string_length": len(text),
+                    })
+                indicators = sorted({
+                    match.group(1).lower()
+                    for match in CREDENTIAL_HINT_RE.finditer(text)
+                })
+                if indicators:
+                    credential_hints.append({
+                        "entry": zi.filename,
+                        "indicators": indicators,
+                        "string_length": len(text),
+                    })
 
     return {
         "apk_sha256": file_sha256(apk),
