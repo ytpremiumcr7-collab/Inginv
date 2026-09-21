@@ -124,3 +124,32 @@ def test_polymorphic_controller_edge_reaches_device_policy_sink():
     paths = _shortest_paths(task, graph, 6)
     assert paths[0]["sink"] == "DEVICE_REBOOT"
     assert paths[0]["path"] == [task, interface_call, implementation, sink]
+
+
+@pytest.mark.parametrize(
+    ("sink_method", "expected_sink"),
+    [
+        (
+            "Landroid/content/pm/PackageInstaller$Session;->commit(Landroid/content/IntentSender;)V",
+            "PACKAGE_INSTALL_COMMIT",
+        ),
+        (
+            "Ljava/lang/Runtime;->exec(Ljava/lang/String;)Ljava/lang/Process;",
+            "RUNTIME_EXEC",
+        ),
+        (
+            "Ljava/io/File;->delete()Z",
+            "FILE_DELETE",
+        ),
+    ],
+)
+def test_required_privileged_sink_regressions(sink_method, expected_sink):
+    from inginv.dex import _shortest_paths
+
+    seed = "Lapp/Task;->execute()V"
+    bridge = "Lapp/Controller;->apply()V"
+    graph = {seed: {bridge}, bridge: {sink_method}}
+    paths = _shortest_paths(seed, graph, 4)
+    assert paths
+    assert paths[0]["sink"] == expected_sink
+    assert paths[0]["path"][-1] == sink_method
