@@ -156,6 +156,7 @@ def test_required_privileged_sink_regressions(sink_method, expected_sink):
 
 
 def test_d8_two_stage_string_switch_resolves_concrete_task():
+    # Pure bytecode fixture: no APK execution and no network activity.
     import struct
     from types import SimpleNamespace
     from inginv.dex import MethodCode, _discover_dispatches_in_method
