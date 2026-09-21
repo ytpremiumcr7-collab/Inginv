@@ -43,3 +43,7 @@ See [`docs/EVIDENCE_MODEL.md`](docs/EVIDENCE_MODEL.md).
 Do not commit APKs, device dumps, serial numbers, Wi-Fi identifiers, private keys, tokens, passwords, or unredacted forensic exports. The public repository is for tooling, sanitized evidence summaries, and reproducible methodology.
 
 See [`SECURITY.md`](SECURITY.md).
+
+## Offline-only analysis
+
+Inginv treats endpoints discovered in analyzed artifacts as inert evidence. Analysis and tests must not contact vendor/provider infrastructure. Run `python -m inginv offline-guard .` to enforce the production-source network policy; the pytest suite also blocks DNS/socket connections. See [`docs/OFFLINE_ANALYSIS_POLICY.md`](docs/OFFLINE_ANALYSIS_POLICY.md).
