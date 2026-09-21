@@ -212,6 +212,23 @@ def scan_history(root: Path, max_blob_bytes: int = 8 * 1024 * 1024) -> list[Guar
     return findings
 
 
+def scan_commit_messages(root: Path) -> list[GuardFinding]:
+    """Scan reachable commit messages without reproducing matching values."""
+    output = _git(root, "log", "--all", "--format=%H%x00%B%x00")
+    parts = output.split("\x00")
+    findings: list[GuardFinding] = []
+    for index in range(0, len(parts) - 1, 2):
+        commit = parts[index].strip()
+        message = parts[index + 1]
+        if not commit or not message:
+            continue
+        findings.extend(
+            replace(finding, blob=commit)
+            for finding in scan_text(f"<commit-message:{commit[:12]}>", message)
+        )
+    return findings
+
+
 def _load_baseline(root: Path, relative_path: str | None) -> list[BaselineEntry]:
     if not relative_path:
         return []
@@ -264,6 +281,7 @@ def scan_repository(
     findings = scan_paths(root_path, blobs, blob_ids=blobs)
     if history:
         findings.extend(scan_history(root_path))
+        findings.extend(scan_commit_messages(root_path))
 
     unique = {
         (f.rule, f.severity, f.path, f.line, f.evidence, f.blob): f
