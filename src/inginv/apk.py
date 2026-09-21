@@ -20,6 +20,51 @@ COMMAND_HINTS = {
     "powerOff", "remoteCare", "sourceFile", "oemConfig", "TCPing",
 }
 
+MAX_ARCHIVE_ENTRIES = 100_000
+MAX_ENTRY_UNCOMPRESSED = 256 * 1024 * 1024
+MAX_TOTAL_UNCOMPRESSED = 1024 * 1024 * 1024
+MAX_STRING_SCAN_TOTAL = 512 * 1024 * 1024
+
+
+class ApkSafetyError(ValueError):
+    pass
+
+
+def validate_apk_archive(
+    zf: zipfile.ZipFile,
+    *,
+    max_entries: int = MAX_ARCHIVE_ENTRIES,
+    max_entry_uncompressed: int = MAX_ENTRY_UNCOMPRESSED,
+    max_total_uncompressed: int = MAX_TOTAL_UNCOMPRESSED,
+) -> list[zipfile.ZipInfo]:
+    """Fail closed before decompressing an unexpectedly large APK archive."""
+    infos = [zi for zi in zf.infolist() if not zi.is_dir()]
+    if len(infos) > max_entries:
+        raise ApkSafetyError(f"APK has too many entries: {len(infos)} > {max_entries}")
+
+    total = 0
+    for zi in infos:
+        if zi.file_size < 0 or zi.compress_size < 0:
+            raise ApkSafetyError(f"invalid ZIP sizes for {zi.filename}")
+        if zi.file_size > max_entry_uncompressed:
+            raise ApkSafetyError(
+                f"APK entry too large: {zi.filename} ({zi.file_size} bytes)"
+            )
+        total += zi.file_size
+        if total > max_total_uncompressed:
+            raise ApkSafetyError(
+                f"APK uncompressed size exceeds budget: {total} > {max_total_uncompressed}"
+            )
+    return infos
+
+
+def _zip_entry_sha256(zf: zipfile.ZipFile, zi: zipfile.ZipInfo) -> str:
+    digest = sha256()
+    with zf.open(zi, "r") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
 
 def _safe_url(value: str) -> str:
     """Preserve endpoint structure while dropping credentials and volatile identifiers."""
@@ -93,17 +138,15 @@ def summarize(path: str | Path) -> dict:
     entries: list[Entry] = []
     traversal: list[str] = []
     with zipfile.ZipFile(apk) as zf:
+        infos = validate_apk_archive(zf)
         corrupt = zf.testzip()
-        for zi in zf.infolist():
-            if zi.is_dir():
-                continue
-            data = zf.read(zi)
+        for zi in infos:
             entries.append(Entry(
                 name=zi.filename,
                 size=zi.file_size,
                 compressed_size=zi.compress_size,
                 kind=classify(zi.filename),
-                sha256=sha256(data).hexdigest(),
+                sha256=_zip_entry_sha256(zf, zi),
             ))
             if _entry_has_path_traversal(zi.filename):
                 traversal.append(zi.filename)
@@ -135,8 +178,14 @@ def extract_strings(path: str | Path, *, max_per_entry: int = 10000) -> dict:
     credential_hints: list[dict] = []
 
     with zipfile.ZipFile(apk) as zf:
-        for zi in zf.infolist():
-            if zi.is_dir() or zi.file_size > 64 * 1024 * 1024:
+        infos = validate_apk_archive(zf)
+        scan_total = sum(zi.file_size for zi in infos if zi.file_size <= 64 * 1024 * 1024)
+        if scan_total > MAX_STRING_SCAN_TOTAL:
+            raise ApkSafetyError(
+                f"APK printable-string scan exceeds budget: {scan_total} > {MAX_STRING_SCAN_TOTAL}"
+            )
+        for zi in infos:
+            if zi.file_size > 64 * 1024 * 1024:
                 continue
             data = zf.read(zi)
             for raw in URL_RE.findall(data):
