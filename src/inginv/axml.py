@@ -9,6 +9,8 @@ import struct
 import xml.etree.ElementTree as ET
 import zipfile
 
+from .apk import validate_apk_archive
+
 RES_STRING_POOL_TYPE = 0x0001
 RES_XML_TYPE = 0x0003
 RES_XML_START_NAMESPACE_TYPE = 0x0100
@@ -410,10 +412,14 @@ def build_manifest_model(root: AxmlNode) -> dict:
 
 def manifest_matrix(apk_path: str | Path) -> dict:
     with zipfile.ZipFile(apk_path) as zf:
+        validate_apk_archive(zf)
         try:
-            data = zf.read("AndroidManifest.xml")
+            info = zf.getinfo("AndroidManifest.xml")
         except KeyError as exc:
             raise AxmlError("APK has no AndroidManifest.xml") from exc
+        if info.file_size > 8 * 1024 * 1024:
+            raise AxmlError("AndroidManifest.xml exceeds analysis budget")
+        data = zf.read(info)
     return build_manifest_model(parse_manifest_bytes(data))
 
 
