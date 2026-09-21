@@ -201,3 +201,59 @@ def test_d8_two_stage_string_switch_resolves_concrete_task():
     assert discoveries[0]["second_switch_kind"] == "packed"
     assert discoveries[0]["task_types"] == ["Lapp/RebootTask;"]
     assert discoveries[0]["confidence"] == "high"
+
+
+def test_async_edge_requires_concrete_runnable_at_callsite():
+    import struct
+    from types import SimpleNamespace
+    from inginv.dex import MethodCode, _add_bound_async_and_callback_edges
+
+    ctor = MethodRef(0, "Lapp/Job;", "<init>", "()V")
+    add = MethodRef(1, "Lapp/ThreadPool;", "add", "(Ljava/lang/Runnable;)Z")
+    caller_ref = MethodRef(2, "Lapp/Manager;", "schedule", "()V")
+    run_ref = MethodRef(3, "Lapp/Job;", "run", "()V")
+
+    units = [
+        0x0022, 0x0000,
+        0x1070, 0x0000, 0x0000,
+        0x206E, 0x0001, 0x0001,
+        0x000E,
+    ]
+    data = bytearray(16 + len(units) * 2)
+    struct.pack_into("<H", data, 0, 2)
+    struct.pack_into("<H", data, 2, 1)
+    struct.pack_into("<I", data, 12, len(units))
+    struct.pack_into(f"<{len(units)}H", data, 16, *units)
+
+    dex = SimpleNamespace(
+        data=bytes(data),
+        strings=[],
+        types=["Lapp/Job;"],
+        fields=[],
+        methods=[ctor, add],
+    )
+    caller = MethodCode(
+        caller_ref, 0, calls={0, 1}, access_flags=0, registers_size=2, ins_size=1
+    )
+    run = MethodCode(run_ref, 0)
+    graph = {
+        caller_ref.full_name: {ctor.full_name, add.full_name},
+        run_ref.full_name: set(),
+    }
+    supertypes = {
+        "Lapp/Manager;": {"Ljava/lang/Object;"},
+        "Lapp/Job;": {"Ljava/lang/Object;", "Ljava/lang/Runnable;"},
+    }
+
+    async_edges, callback_edges, bound = _add_bound_async_and_callback_edges(
+        [dex], [(dex, caller), (dex, run)], graph, supertypes
+    )
+    assert callback_edges == []
+    assert bound == set()
+    assert run_ref.full_name in graph[caller_ref.full_name]
+    assert async_edges == [{
+        "caller": caller_ref.full_name,
+        "dispatch": add.full_name,
+        "callback": run_ref.full_name,
+        "evidence": "concrete Runnable type proven in dispatch argument register",
+    }]
