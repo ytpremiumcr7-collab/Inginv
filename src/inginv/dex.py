@@ -24,12 +24,27 @@ class MethodRef:
         return f"{self.owner}->{self.name}{self.descriptor}"
 
 
+@dataclass(frozen=True)
+class FieldRef:
+    index: int
+    owner: str
+    name: str
+    descriptor: str
+
+    @property
+    def full_name(self) -> str:
+        return f"{self.owner}->{self.name}:{self.descriptor}"
+
+
 @dataclass
 class MethodCode:
     method: MethodRef
     code_off: int
     strings: set[str] = field(default_factory=set)
     calls: set[int] = field(default_factory=set)
+    access_flags: int = 0
+    registers_size: int = 0
+    ins_size: int = 0
 
 
 SINK_PATTERNS: tuple[tuple[str, str], ...] = (
@@ -189,6 +204,7 @@ class DexFile:
         self.strings: list[str] = []
         self.types: list[str] = []
         self.methods: list[MethodRef] = []
+        self.fields: list[FieldRef] = []
         self.code: dict[int, MethodCode] = {}
         self.class_supertypes: dict[str, set[str]] = {}
         self._parse()
@@ -205,12 +221,14 @@ class DexFile:
         string_ids_size, string_ids_off = _u32(data, 56), _u32(data, 60)
         type_ids_size, type_ids_off = _u32(data, 64), _u32(data, 68)
         proto_ids_size, proto_ids_off = _u32(data, 72), _u32(data, 76)
+        field_ids_size, field_ids_off = _u32(data, 80), _u32(data, 84)
         method_ids_size, method_ids_off = _u32(data, 88), _u32(data, 92)
         class_defs_size, class_defs_off = _u32(data, 96), _u32(data, 100)
 
         self._check_table(string_ids_off, string_ids_size, 4)
         self._check_table(type_ids_off, type_ids_size, 4)
         self._check_table(proto_ids_off, proto_ids_size, 12)
+        self._check_table(field_ids_off, field_ids_size, 8)
         self._check_table(method_ids_off, method_ids_size, 8)
         self._check_table(class_defs_off, class_defs_size, 32)
 
@@ -229,6 +247,20 @@ class DexFile:
                 raise DexError("return type index out of range")
             params = _type_list(data, parameters_off, self.types)
             protos.append("(" + "".join(params) + ")" + self.types[return_type_idx])
+
+        for i in range(field_ids_size):
+            off = field_ids_off + i * 8
+            class_idx = _u16(data, off)
+            type_idx = _u16(data, off + 2)
+            name_idx = _u32(data, off + 4)
+            if class_idx >= len(self.types) or type_idx >= len(self.types):
+                raise DexError("field id references out-of-range type")
+            self.fields.append(FieldRef(
+                index=i,
+                owner=self.types[class_idx],
+                name=self._string(name_idx),
+                descriptor=self.types[type_idx],
+            ))
 
         for i in range(method_ids_size):
             off = method_ids_off + i * 8
@@ -293,17 +325,21 @@ class DexFile:
             method_index = 0
             for _ in range(count):
                 diff, off = _uleb(data, off)
-                _, off = _uleb(data, off)
+                access_flags, off = _uleb(data, off)
                 code_off, off = _uleb(data, off)
                 method_index += diff
                 if method_index >= len(self.methods):
                     raise DexError("encoded method index out of range")
                 if code_off:
-                    self.code[method_index] = self._parse_code_item(method_index, code_off)
+                    self.code[method_index] = self._parse_code_item(
+                        method_index, code_off, access_flags
+                    )
 
-    def _parse_code_item(self, method_index: int, off: int) -> MethodCode:
+    def _parse_code_item(self, method_index: int, off: int, access_flags: int = 0) -> MethodCode:
         if off + 16 > len(self.data):
             raise DexError("code_item outside file")
+        registers_size = _u16(self.data, off)
+        ins_size = _u16(self.data, off + 2)
         insns_size = _u32(self.data, off + 12)
         insns_off = off + 16
         end = insns_off + insns_size * 2
@@ -311,7 +347,15 @@ class DexFile:
             raise DexError("instruction stream outside file")
         units = list(struct.unpack_from(f"<{insns_size}H", self.data, insns_off)) if insns_size else []
         string_refs, calls = decode_code_units(units, self.strings, self.methods)
-        return MethodCode(self.methods[method_index], off, string_refs, calls)
+        return MethodCode(
+            self.methods[method_index],
+            off,
+            string_refs,
+            calls,
+            access_flags=access_flags,
+            registers_size=registers_size,
+            ins_size=ins_size,
+        )
 
 
 def _classify_owner(owner: str, first_party_prefixes: tuple[str, ...]) -> str:
