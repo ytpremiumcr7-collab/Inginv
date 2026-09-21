@@ -28,19 +28,19 @@ def test_summary_hashes_every_file_without_leaking_parent_path(tmp_path: Path):
 
 def test_string_export_does_not_reproduce_credential_values(tmp_path: Path):
     apk = tmp_path / "sample.apk"
-    user = "operator"
-    password = "654321"
+    login_name = "operator"
+    credential_value = "654321"
     payload = (
-        f"ssl://{user}:{password}@example.invalid:1886/client?token=abcdef "
-        f"installApp password={password} username={user}"
+        f"ssl://{login_name}:{credential_value}@example.invalid:1886/client?token=abcdef "
+        f"installApp password={credential_value} username={login_name}"
     ).encode()
     with zipfile.ZipFile(apk, "w") as zf:
         zf.writestr("classes.dex", payload)
 
     report = extract_strings(apk)
     rendered = str(report)
-    assert user not in rendered
-    assert password not in rendered
+    assert login_name not in rendered
+    assert credential_value not in rendered
     assert "abcdef" not in rendered
     assert any(url.startswith("ssl://example.invalid:1886/client") for url in report["urls"])
     assert report["command_hits"][0]["commands"] == ["installApp"]
