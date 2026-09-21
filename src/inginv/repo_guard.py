@@ -11,7 +11,9 @@ from .redact import redact
 
 FORBIDDEN_SUFFIXES = {
     ".apk", ".aab", ".apks", ".xapk", ".dex", ".odex", ".vdex", ".oat",
-    ".bks", ".jks", ".keystore", ".p12", ".pfx", ".pcap", ".pcapng", ".har",
+    ".bks", ".jks", ".keystore", ".p12", ".pfx", ".pem", ".key",
+    ".pcap", ".pcapng", ".har", ".sqlite", ".db", ".log",
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".mov",
 }
 FORBIDDEN_BASENAME_RE = re.compile(
     r"(?i)(?:_FULL_REPORT|_ACTIVE_REPORT|^logcat(?:_|\\.)|^getprop(?:_|\\.)|^tcp(?:_|\\.))"
@@ -31,7 +33,15 @@ CREDENTIAL_ASSIGNMENT_RE = re.compile(
 SERIAL_RE = re.compile(r"(?i)\bro\.serialno\b\s*[:=]\s*\S+")
 SSID_RE = re.compile(r'(?i)\bSSID\s*[:=]\s*"[^"]+"')
 BSSID_RE = re.compile(r"(?i)\bBSSID\s*[:=]\s*(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b")
-SAFE_MARKERS = ("<redacted>", "redacted", "example", "dummy", "placeholder", "not-a-real", "changeme", "your_", "your-", "${", "{{")
+SAFE_MARKERS = (
+    "<redacted>", "redacted", "example", "dummy", "placeholder",
+    "not-a-real", "changeme", "your_", "your-", "${", "{{",
+    "os.environ", "getenv(", "environ[",
+)
+
+PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----"
+)
 
 
 @dataclass(frozen=True)
@@ -55,12 +65,11 @@ def _safe_example(value: str) -> bool:
 def scan_text_high_confidence(path: str, text: str) -> list[GuardFinding]:
     """Patterns safe to apply to immutable history with a very low false-positive rate."""
     findings: list[GuardFinding] = []
-    private_key_marker = "-----BEGIN " + "PRIVATE KEY-----"
-    if private_key_marker in text:
+    for match in PRIVATE_KEY_RE.finditer(text):
         findings.append(GuardFinding(
             "PRIVATE_KEY", "critical", path,
-            _line(text, text.index(private_key_marker)),
-            private_key_marker,
+            _line(text, match.start()),
+            "<PRIVATE_KEY_MATERIAL_REDACTED>",
         ))
     for rule, severity, pattern in TOKEN_RULES:
         for match in pattern.finditer(text):
@@ -132,7 +141,7 @@ def tracked_paths(root: Path) -> list[str]:
     return [p for p in _git(root, "ls-files").splitlines() if p]
 
 
-def scan_history(root: Path, max_blob_bytes: int = 2 * 1024 * 1024) -> list[GuardFinding]:
+def scan_history(root: Path, max_blob_bytes: int = 8 * 1024 * 1024) -> list[GuardFinding]:
     findings: list[GuardFinding] = []
     seen: set[str] = set()
     for line in _git(root, "rev-list", "--objects", "--all").splitlines():
@@ -154,7 +163,7 @@ def scan_history(root: Path, max_blob_bytes: int = 2 * 1024 * 1024) -> list[Guar
         ).stdout
         if _looks_binary(raw):
             continue
-        findings.extend(scan_text_high_confidence(f"{path}@{oid[:12]}", raw.decode("utf-8", "replace")))
+        findings.extend(scan_text(f"{path}@{oid[:12]}", raw.decode("utf-8", "replace")))
         if Path(path).suffix.lower() in FORBIDDEN_SUFFIXES or FORBIDDEN_BASENAME_RE.search(Path(path).name):
             findings.append(GuardFinding(
                 "FORBIDDEN_EVIDENCE_ARTIFACT_HISTORY", "critical",
