@@ -7,8 +7,23 @@ from pathlib import Path
 from .apk import dump_json, extract_strings, summarize
 from .axml import manifest_matrix, write_component_csv
 from .dex import trace_apk
+from .evidence import build_report, dump_report_json, dump_report_markdown, findings_from_analysis
 from .repo_guard import dump_guard_json, scan_repository
 from .runtime import collect_runtime, correlate_static_runtime, dump_runtime_json
+
+REPORT_INPUT_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _read_json_object(path: Path, *, max_bytes: int = REPORT_INPUT_MAX_BYTES) -> dict:
+    if max_bytes < 1:
+        raise ValueError("max_bytes must be positive")
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise ValueError(f"analysis JSON exceeds size budget: {size} > {max_bytes}")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"analysis JSON must contain an object: {path.name}")
+    return value
 
 
 def _write_or_print(data: dict, output: str | None) -> None:
@@ -62,6 +77,13 @@ def main(argv: list[str] | None = None) -> int:
     correlate.add_argument("--dex-json", type=Path)
     correlate.add_argument("--json", dest="output")
 
+    report = sub.add_parser("report", help="Generate provenance-aware sanitized findings from analysis JSON")
+    report.add_argument("--manifest-json", type=Path)
+    report.add_argument("--dex-json", type=Path)
+    report.add_argument("--correlation-json", type=Path)
+    report.add_argument("--json", dest="output")
+    report.add_argument("--markdown", dest="markdown_output")
+
     guard = sub.add_parser("repo-guard", help="Scan tracked files and optional Git history for secrets/private evidence")
     guard.add_argument("root", nargs="?", default=".", type=Path)
     guard.add_argument("--history", action="store_true")
@@ -103,13 +125,13 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(bundle, indent=2, sort_keys=True))
         return 0
     if args.command == "correlate":
-        runtime_bundle = json.loads(args.runtime_json.read_text(encoding="utf-8"))
+        runtime_bundle = _read_json_object(args.runtime_json)
         manifest_model = (
-            json.loads(args.manifest_json.read_text(encoding="utf-8"))
+            _read_json_object(args.manifest_json)
             if args.manifest_json else None
         )
         dex_trace = (
-            json.loads(args.dex_json.read_text(encoding="utf-8"))
+            _read_json_object(args.dex_json)
             if args.dex_json else None
         )
         report = correlate_static_runtime(
@@ -122,6 +144,45 @@ def main(argv: list[str] | None = None) -> int:
             print(f"wrote {args.output}")
         else:
             print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
+    if args.command == "report":
+        if not any((args.manifest_json, args.dex_json, args.correlation_json)):
+            parser.error("report requires at least one analysis JSON input")
+        manifest_model = (
+            _read_json_object(args.manifest_json)
+            if args.manifest_json else None
+        )
+        dex_trace = (
+            _read_json_object(args.dex_json)
+            if args.dex_json else None
+        )
+        correlation = (
+            _read_json_object(args.correlation_json)
+            if args.correlation_json else None
+        )
+        findings = findings_from_analysis(
+            manifest_model=manifest_model,
+            dex_trace=dex_trace,
+            correlation=correlation,
+        )
+        report_data = build_report(
+            findings,
+            metadata={
+                "inputs": {
+                    "manifest": bool(args.manifest_json),
+                    "dex": bool(args.dex_json),
+                    "correlation": bool(args.correlation_json),
+                }
+            },
+        )
+        if args.output:
+            dump_report_json(report_data, args.output)
+            print(f"wrote {args.output}")
+        if args.markdown_output:
+            dump_report_markdown(report_data, args.markdown_output)
+            print(f"wrote {args.markdown_output}")
+        if not args.output and not args.markdown_output:
+            print(json.dumps(report_data, indent=2, sort_keys=True))
         return 0
     if args.command == "repo-guard":
         report = scan_repository(args.root, history=args.history)

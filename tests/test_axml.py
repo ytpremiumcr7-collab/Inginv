@@ -43,6 +43,7 @@ def test_manifest_matrix_reads_apk(tmp_path: Path):
         zf.writestr("AndroidManifest.xml", PLAINTEXT_MANIFEST)
     model = manifest_matrix(apk)
     assert len(model["components"]) == 2
+    assert len(model["apk_sha256"]) == 64
 
 
 def test_rejects_missing_manifest(tmp_path: Path):

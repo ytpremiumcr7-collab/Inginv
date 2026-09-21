@@ -420,6 +420,7 @@ def correlate_static_runtime(
 
     return {
         "schema": "inginv.correlation.v1",
+        "capture_id": runtime_bundle.get("capture_id"),
         "package": package,
         "runtime_facts": runtime_facts,
         "correlations": correlations,
