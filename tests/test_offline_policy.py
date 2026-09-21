@@ -76,3 +76,20 @@ def test_repository_source_guard_is_clean():
     root = Path(__file__).resolve().parents[1]
     report = scan_repository_source(root)
     assert report["finding_count"] == 0
+
+
+@pytest.mark.parametrize(
+    "source, expected_rule",
+    [
+        ("import importlib\nimportlib.import_module('requests')\n", "DYNAMIC_NETWORK_IMPORT"),
+        ("__import__('socket')\n", "DYNAMIC_NETWORK_IMPORT"),
+        ("import subprocess as sp\nsp.run(['wget', 'https://example.invalid'])\n", "NETWORK_SUBPROCESS"),
+        ("from subprocess import run as launch\nlaunch(['curl', 'https://example.invalid'])\n", "NETWORK_SUBPROCESS"),
+        ("import os as operating_system\noperating_system.system('curl https://example.invalid')\n", "NETWORK_SUBPROCESS"),
+        ("from os import system as shell\nshell('wget https://example.invalid')\n", "NETWORK_SUBPROCESS"),
+        ("import asyncio as aio\naio.create_subprocess_exec('curl', 'https://example.invalid')\n", "NETWORK_SUBPROCESS"),
+    ],
+)
+def test_detects_aliased_dynamic_and_shell_network_paths(source, expected_rule):
+    findings = scan_python_source("bad.py", source)
+    assert any(finding.rule == expected_rule for finding in findings)
