@@ -151,7 +151,12 @@ def scan_paths(
     findings: list[GuardFinding] = []
     for rel in sorted(set(relative_paths)):
         path = root / rel
-        blob = (blob_ids or {}).get(rel)
+        # Baselines are pinned to the bytes actually being scanned, not merely
+        # to the index entry. A dirty working tree must invalidate a reviewed
+        # baseline automatically.
+        blob = None
+        if path.is_file() and blob_ids is not None and rel in blob_ids:
+            blob = _git(root, "hash-object", "--", rel).strip() or None
         if path.suffix.lower() in FORBIDDEN_SUFFIXES or FORBIDDEN_BASENAME_RE.search(path.name):
             findings.append(GuardFinding(
                 "FORBIDDEN_EVIDENCE_ARTIFACT", "critical", rel, None,
