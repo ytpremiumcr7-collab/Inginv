@@ -6,6 +6,7 @@ from pathlib import Path, PurePosixPath
 import json
 import re
 import zipfile
+from urllib.parse import urlsplit, urlunsplit
 
 from .redact import redact
 
@@ -18,6 +19,25 @@ COMMAND_HINTS = {
     "setPasscode", "clearPasscode", "clearAppCache", "lock", "unlock",
     "powerOff", "remoteCare", "sourceFile", "oemConfig", "TCPing",
 }
+
+
+def _safe_url(value: str) -> str:
+    """Preserve endpoint structure while dropping credentials and volatile identifiers."""
+    sanitized = redact(value)
+    try:
+        parsed = urlsplit(sanitized)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return "<REDACTED_URL>"
+    if not parsed.scheme or not host:
+        return "<REDACTED_URL>"
+    netloc = host if port is None else f"{host}:{port}"
+    segments = [
+        "<REDACTED_SEGMENT>" if len(segment) >= 48 else segment
+        for segment in (parsed.path or "").split("/")
+    ]
+    return urlunsplit((parsed.scheme, netloc, "/".join(segments), "", ""))
 
 
 @dataclass(frozen=True)
