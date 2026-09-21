@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha256
+import html
 import json
 from pathlib import Path
 from typing import Iterable
@@ -318,6 +319,11 @@ def build_report(
     }
 
 
+def _md(value: object) -> str:
+    """Escape untrusted evidence for Markdown renderers that allow raw HTML."""
+    return html.escape(str(value), quote=True).replace("`", "\\`")
+
+
 def report_markdown(report: dict) -> str:
     safe = _sanitize(report)
     lines = [
@@ -330,18 +336,18 @@ def report_markdown(report: dict) -> str:
     ]
     for finding in safe.get("findings", []):
         lines.extend([
-            f"## {finding['finding_id']} — {finding['title']}",
+            f"## {_md(finding['finding_id'])} — {_md(finding['title'])}",
             "",
             f"- Evidence state: `{finding['evidence_state']}`",
             f"- Severity: `{finding['severity']}`",
             f"- Confidence: `{finding['confidence']}`",
             f"- Category: `{finding['category']}`",
             "",
-            f"**Consequence:** {finding['consequence']}",
+            f"**Consequence:** {_md(finding['consequence'])}",
             "",
-            f"**Does not prove:** {finding['does_not_prove']}",
+            f"**Does not prove:** {_md(finding['does_not_prove'])}",
             "",
-            f"**Remediation direction:** {finding['remediation']}",
+            f"**Remediation direction:** {_md(finding['remediation'])}",
             "",
             "**Evidence:**",
         ])
