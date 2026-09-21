@@ -8,6 +8,7 @@ from .apk import dump_json, extract_strings, summarize
 from .axml import manifest_matrix, write_component_csv
 from .dex import trace_apk
 from .evidence import build_report, dump_report_json, dump_report_markdown, findings_from_analysis
+from .offline_policy import scan_repository_source
 from .repo_guard import dump_guard_json, scan_repository
 from .runtime import collect_runtime, correlate_static_runtime, dump_runtime_json
 
@@ -83,6 +84,12 @@ def main(argv: list[str] | None = None) -> int:
     report.add_argument("--correlation-json", type=Path)
     report.add_argument("--json", dest="output")
     report.add_argument("--markdown", dest="markdown_output")
+
+    offline = sub.add_parser(
+        "offline-guard",
+        help="Fail if production source can initiate direct network/provider access",
+    )
+    offline.add_argument("root", nargs="?", default=".", type=Path)
 
     guard = sub.add_parser("repo-guard", help="Scan tracked files and optional Git history for secrets/private evidence")
     guard.add_argument("root", nargs="?", default=".", type=Path)
@@ -184,6 +191,10 @@ def main(argv: list[str] | None = None) -> int:
         if not args.output and not args.markdown_output:
             print(json.dumps(report_data, indent=2, sort_keys=True))
         return 0
+    if args.command == "offline-guard":
+        report = scan_repository_source(args.root)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 1 if report["finding_count"] else 0
     if args.command == "repo-guard":
         report = scan_repository(args.root, history=args.history)
         if args.output:
