@@ -9,6 +9,8 @@ import struct
 import xml.etree.ElementTree as ET
 import zipfile
 
+from .apk import validate_apk_archive
+
 RES_STRING_POOL_TYPE = 0x0001
 RES_XML_TYPE = 0x0003
 RES_XML_START_NAMESPACE_TYPE = 0x0100
@@ -301,8 +303,8 @@ def _intent_filters(component: AxmlNode) -> list[dict]:
 
 def _component_risk_hints(component: dict) -> list[str]:
     hints: list[str] = []
-    if component["exported_declared"] is True and not component["permission"]:
-        hints.append("exported_without_component_permission")
+    if component["exported_declared"] is True and not component["access_permissions"]:
+        hints.append("exported_without_access_permission")
     actions = {a for f in component["intent_filters"] for a in f["actions"]}
     categories = {c for f in component["intent_filters"] for c in f["categories"]}
     if "android.intent.action.BOOT_COMPLETED" in actions or "android.intent.action.LOCKED_BOOT_COMPLETED" in actions:
@@ -342,12 +344,28 @@ def build_manifest_model(root: AxmlNode) -> dict:
         })
 
     components: list[dict] = []
+    application_permission = app.attr("permission") if app else None
     if app:
         for child in app.children:
             if child.tag not in {"activity", "activity-alias", "service", "receiver", "provider"}:
                 continue
             filters = _intent_filters(child)
             exported_declared = _bool(child.attr("exported"))
+            declared_permission = child.attr("permission")
+            effective_permission = declared_permission or application_permission
+            effective_read_permission = None
+            effective_write_permission = None
+            if child.tag == "provider":
+                effective_read_permission = child.attr("readPermission") or effective_permission
+                effective_write_permission = child.attr("writePermission") or effective_permission
+            access_permissions = sorted({
+                value for value in (
+                    effective_permission,
+                    effective_read_permission,
+                    effective_write_permission,
+                )
+                if value
+            })
             component = {
                 "kind": child.tag,
                 "name": child.attr("name"),
@@ -355,9 +373,13 @@ def build_manifest_model(root: AxmlNode) -> dict:
                 "exported_declared": exported_declared,
                 "enabled": _bool(child.attr("enabled")),
                 "direct_boot_aware": _bool(child.attr("directBootAware")),
-                "permission": child.attr("permission"),
+                "permission": declared_permission,
                 "read_permission": child.attr("readPermission"),
                 "write_permission": child.attr("writePermission"),
+                "effective_permission": effective_permission,
+                "effective_read_permission": effective_read_permission,
+                "effective_write_permission": effective_write_permission,
+                "access_permissions": access_permissions,
                 "process": child.attr("process"),
                 "authorities": child.attr("authorities"),
                 "has_intent_filter": bool(filters),
@@ -382,6 +404,7 @@ def build_manifest_model(root: AxmlNode) -> dict:
             "direct_boot_aware": _bool(app.attr("directBootAware")) if app else None,
             "uses_cleartext_traffic": _bool(app.attr("usesCleartextTraffic")) if app else None,
             "network_security_config": app.attr("networkSecurityConfig") if app else None,
+            "permission": application_permission,
         },
         "components": components,
     }
@@ -389,10 +412,14 @@ def build_manifest_model(root: AxmlNode) -> dict:
 
 def manifest_matrix(apk_path: str | Path) -> dict:
     with zipfile.ZipFile(apk_path) as zf:
+        validate_apk_archive(zf)
         try:
-            data = zf.read("AndroidManifest.xml")
+            info = zf.getinfo("AndroidManifest.xml")
         except KeyError as exc:
             raise AxmlError("APK has no AndroidManifest.xml") from exc
+        if info.file_size > 8 * 1024 * 1024:
+            raise AxmlError("AndroidManifest.xml exceeds analysis budget")
+        data = zf.read(info)
     return build_manifest_model(parse_manifest_bytes(data))
 
 
@@ -400,13 +427,15 @@ def write_component_csv(model: dict, path: str | Path) -> None:
     fields = [
         "kind", "name", "target_activity", "exported_declared", "enabled",
         "direct_boot_aware", "permission", "read_permission", "write_permission",
-        "process", "authorities", "has_intent_filter", "risk_hints",
+        "effective_permission", "effective_read_permission", "effective_write_permission",
+        "access_permissions", "process", "authorities", "has_intent_filter", "risk_hints",
     ]
     with Path(path).open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for component in model["components"]:
             row = {key: component.get(key) for key in fields}
+            row["access_permissions"] = ",".join(component["access_permissions"])
             row["risk_hints"] = ",".join(component["risk_hints"])
             writer.writerow(row)
 

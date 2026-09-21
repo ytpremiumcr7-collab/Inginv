@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 import ipaddress
@@ -111,6 +111,33 @@ def _bounded_decode(data: bytes) -> tuple[str, bool]:
     return sanitize_runtime_text(data.decode("utf-8", "replace")), truncated
 
 
+def _package_lines(text: str, package: str) -> str:
+    """Retain only package-relevant lines from a global dumpsys surface."""
+    return "\n".join(line for line in text.splitlines() if package in line)
+
+
+def _device_owner_section(text: str, package: str) -> str:
+    """Return a privacy-safe Device Owner section without exposing other owners."""
+    lines = text.splitlines()
+    start = None
+    for idx, line in enumerate(lines):
+        if line.strip() == "Device Owner:":
+            start = idx
+            break
+    if start is None:
+        return "<DEVICE_OWNER_SECTION_UNPARSED>"
+
+    collected = [lines[start]]
+    for line in lines[start + 1:]:
+        if line.startswith("  ") and not line.startswith("    ") and line.strip():
+            break
+        collected.append(line)
+    section = "\n".join(collected).strip()
+    if package in section:
+        return section
+    return "Device Owner:\n    <OTHER_OR_NONE_REDACTED>"
+
+
 class AdbCollector:
     def __init__(
         self,
@@ -216,6 +243,8 @@ def collect_runtime(
         ("device", ["shell", "getprop", "ro.product.device"]),
         ("build", ["shell", "getprop", "ro.build.display.id"]),
         ("sdk", ["shell", "getprop", "ro.build.version.sdk"]),
+        ("local_time", ["shell", "date", "+%Y-%m-%dT%H:%M:%S%z"]),
+        ("timezone", ["shell", "getprop", "persist.sys.timezone"]),
     )
     device: dict[str, str | None] = {}
     for name, argv in identity_commands:
@@ -226,14 +255,19 @@ def collect_runtime(
     core_commands = (
         ("device_policy", ["shell", "dumpsys", "device_policy"]),
         ("package", ["shell", "dumpsys", "package", package]),
-        ("processes", ["shell", "ps", "-A"]),
+        ("process", ["shell", "pidof", package]),
         ("services", ["shell", "dumpsys", "activity", "services", package]),
         ("jobs", ["shell", "dumpsys", "jobscheduler", package]),
         ("alarms", ["shell", "dumpsys", "alarm"]),
         ("appops", ["shell", "appops", "get", package]),
     )
     for name, argv in core_commands:
-        records.append(collector.run(name, argv))
+        result = collector.run(name, argv)
+        if name == "device_policy" and result.exit_code == 0:
+            result = replace(result, stdout=_device_owner_section(result.stdout, package))
+        elif name == "alarms" and result.exit_code == 0:
+            result = replace(result, stdout=_package_lines(result.stdout, package))
+        records.append(result)
 
     if include_network:
         records.append(collector.run("connectivity", ["shell", "dumpsys", "connectivity"]))
@@ -260,6 +294,9 @@ def collect_runtime(
             "raw_secrets_stored": False,
             "network_identifiers_redacted": True,
             "unrelated_full_logcat_collected": False,
+            "full_process_list_collected": False,
+            "alarm_output_package_scoped": True,
+            "device_owner_output_scoped": True,
             "include_network": include_network,
             "requested_logcat_lines": logcat_lines,
         },
@@ -278,47 +315,56 @@ def derive_runtime_facts(bundle: dict) -> list[dict]:
     package = bundle.get("package")
     records = _record_map(bundle)
 
-    policy = records.get("device_policy", {}).get("stdout", "")
-    processes = records.get("processes", {}).get("stdout", "")
-    services = records.get("services", {}).get("stdout", "")
-    jobs = records.get("jobs", {}).get("stdout", "")
+    policy_record = records.get("device_policy", {})
+    process_record = records.get("process", {})
+    services_record = records.get("services", {})
+    jobs_record = records.get("jobs", {})
+
+    policy = policy_record.get("stdout", "")
+    process = process_record.get("stdout", "")
+    services = services_record.get("stdout", "")
+    jobs = jobs_record.get("stdout", "")
 
     owner_patterns = (
         f"package={package}",
         f"ComponentInfo{{{package}/",
         f"admin=ComponentInfo{{{package}/",
     )
-    owner = bool(package and "Device Owner" in policy and any(p in policy for p in owner_patterns))
-    active = bool(package and re.search(rf"(?m)^.*\b{re.escape(str(package))}\b.*$", processes))
-    service_active = bool(package and package in services and "ServiceRecord" in services)
-    job_registered = bool(package and package in jobs and ("JOB #" in jobs or "SystemJobService" in jobs))
+    policy_ok = policy_record.get("exit_code") == 0 and "<DEVICE_OWNER_SECTION_UNPARSED>" not in policy
+    owner = bool(policy_ok and package and any(p in policy for p in owner_patterns))
+    process_ok = process_record.get("exit_code") == 0
+    active = bool(process_ok and process.strip())
+    service_ok = services_record.get("exit_code") == 0
+    service_active = bool(service_ok and package and package in services and "ServiceRecord" in services)
+    jobs_ok = jobs_record.get("exit_code") == 0
+    job_registered = bool(jobs_ok and package and package in jobs and ("JOB #" in jobs or "SystemJobService" in jobs))
 
     facts = [
         RuntimeFact(
             "runtime.device_owner",
-            "RUNTIME_CONFIRMED" if owner else "UNVERIFIED",
-            owner,
+            "RUNTIME_CONFIRMED" if policy_ok else "UNVERIFIED",
+            owner if policy_ok else None,
             ("device_policy",),
             "Device Owner state does not prove that any destructive policy command was issued.",
         ),
         RuntimeFact(
             "runtime.process_active",
-            "RUNTIME_CONFIRMED" if active else "UNVERIFIED",
-            active,
-            ("processes",),
+            "RUNTIME_CONFIRMED" if process_ok else "UNVERIFIED",
+            active if process_ok else None,
+            ("process",),
             "A running process does not prove remote control traffic or command execution.",
         ),
         RuntimeFact(
             "runtime.service_active",
-            "RUNTIME_CONFIRMED" if service_active else "UNVERIFIED",
-            service_active,
+            "RUNTIME_CONFIRMED" if service_ok else "UNVERIFIED",
+            service_active if service_ok else None,
             ("services",),
             "A running service proves persistence/activity, not a particular remote action.",
         ),
         RuntimeFact(
             "runtime.job_registered",
-            "RUNTIME_CONFIRMED" if job_registered else "UNVERIFIED",
-            job_registered,
+            "RUNTIME_CONFIRMED" if jobs_ok else "UNVERIFIED",
+            job_registered if jobs_ok else None,
             ("jobs",),
             "A registered job proves scheduling infrastructure, not that a remote command ran.",
         ),
@@ -379,7 +425,7 @@ def correlate_static_runtime(
         "correlations": correlations,
         "observed_remote_command_execution": {
             "evidence_state": "UNVERIFIED",
-            "value": False,
+            "value": None,
             "reason": (
                 "Inginv requires direct runtime evidence of a specific command execution; "
                 "capability, authority, process state and scheduling are insufficient."

@@ -130,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"wrote {args.output}")
         else:
             print(json.dumps(report, indent=2, sort_keys=True))
-        return 1 if report["finding_count"] else 0
+        return 1 if report.get("blocking_count", report["finding_count"]) else 0
     return 2
 
 
