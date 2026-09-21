@@ -468,7 +468,9 @@ def _add_polymorphic_edges(
     supertypes: dict[str, set[str]],
     *,
     max_candidates_per_signature: int = 64,
+    excluded_target_owners: set[str] | None = None,
 ) -> int:
+    excluded_target_owners = excluded_target_owners or set()
     implementations: dict[tuple[str, str], list[str]] = {}
     for full in code_methods:
         _, name, descriptor = _method_parts(full)
@@ -479,6 +481,8 @@ def _add_polymorphic_edges(
     callees = {callee for values in graph.values() for callee in values}
     for callee in sorted(callees):
         target_owner, name, descriptor = _method_parts(callee)
+        if target_owner in excluded_target_owners:
+            continue
         if target_owner not in supertypes:
             continue
         candidates = implementations.get((name, descriptor), ())
@@ -494,8 +498,44 @@ def _add_polymorphic_edges(
     return added
 
 
+def _signed8(value: int) -> int:
+    return value - 0x100 if value & 0x80 else value
+
+
 def _signed16(value: int) -> int:
     return value - 0x10000 if value & 0x8000 else value
+
+
+def _signed32(value: int) -> int:
+    return value - 0x100000000 if value & 0x80000000 else value
+
+
+def _switch_cases(units: list[int], switch_offset: int, payload_offset: int) -> dict[int, int]:
+    if payload_offset < 0 or payload_offset + 2 > len(units):
+        return {}
+    ident = units[payload_offset]
+    size = units[payload_offset + 1]
+    cases: dict[int, int] = {}
+    if ident == 0x0100:
+        if payload_offset + 4 + size * 2 > len(units):
+            return {}
+        first = _signed32(units[payload_offset + 2] | (units[payload_offset + 3] << 16))
+        pos = payload_offset + 4
+        for index in range(size):
+            rel = _signed32(units[pos + index * 2] | (units[pos + index * 2 + 1] << 16))
+            cases[first + index] = switch_offset + rel
+        return cases
+    if ident == 0x0200:
+        keys_start = payload_offset + 2
+        targets_start = keys_start + size * 2
+        if targets_start + size * 2 > len(units):
+            return {}
+        for index in range(size):
+            key = _signed32(units[keys_start + index * 2] | (units[keys_start + index * 2 + 1] << 16))
+            rel = _signed32(units[targets_start + index * 2] | (units[targets_start + index * 2 + 1] << 16))
+            cases[key] = switch_offset + rel
+        return cases
+    return {}
 
 
 def _invoke_registers(units: list[int], index: int, opcode: int) -> list[int]:
@@ -540,10 +580,36 @@ def _decode_dispatch_records(dex: DexFile, code: MethodCode) -> list[dict]:
                 register=(units[i] >> 8) & 0xFF,
                 string_index=units[i + 1] | (units[i + 2] << 16),
             )
+        elif opcode == 0x12:
+            register = (units[i] >> 8) & 0xF
+            raw_literal = (units[i] >> 12) & 0xF
+            literal = raw_literal - 16 if raw_literal & 0x8 else raw_literal
+            record.update(kind="const-int", register=register, value=literal)
+        elif opcode == 0x13 and i + 1 < len(units):
+            record.update(kind="const-int", register=(units[i] >> 8) & 0xFF, value=_signed16(units[i + 1]))
+        elif opcode == 0x14 and i + 2 < len(units):
+            value = _signed32(units[i + 1] | (units[i + 2] << 16))
+            record.update(kind="const-int", register=(units[i] >> 8) & 0xFF, value=value)
+        elif opcode == 0x15 and i + 1 < len(units):
+            record.update(
+                kind="const-int",
+                register=(units[i] >> 8) & 0xFF,
+                value=_signed16(units[i + 1]) << 16,
+            )
         elif opcode == 0x22 and i + 1 < len(units):
             type_index = units[i + 1]
             if type_index < len(dex.types):
                 record.update(kind="new-instance", register=(units[i] >> 8) & 0xFF, type=dex.types[type_index])
+        elif opcode in {0x01, 0x04, 0x07}:
+            record.update(
+                kind="move",
+                dest=(units[i] >> 8) & 0xF,
+                source=(units[i] >> 12) & 0xF,
+            )
+        elif opcode in {0x02, 0x05, 0x08} and i + 1 < len(units):
+            record.update(kind="move", dest=(units[i] >> 8) & 0xFF, source=units[i + 1])
+        elif opcode in {0x03, 0x06, 0x09} and i + 2 < len(units):
+            record.update(kind="move", dest=units[i + 1], source=units[i + 2])
         elif opcode in {0x0A, 0x0B, 0x0C}:
             record.update(kind="move-result", register=(units[i] >> 8) & 0xFF)
         elif opcode in {0x38, 0x39} and i + 1 < len(units):
@@ -553,6 +619,65 @@ def _decode_dispatch_records(dex: DexFile, code: MethodCode) -> list[dict]:
                 condition="eqz" if opcode == 0x38 else "nez",
                 target=i + _signed16(units[i + 1]),
             )
+        elif opcode in {0x28, 0x29, 0x2A}:
+            if opcode == 0x28:
+                rel = _signed8((units[i] >> 8) & 0xFF)
+            elif opcode == 0x29 and i + 1 < len(units):
+                rel = _signed16(units[i + 1])
+            elif i + 2 < len(units):
+                rel = _signed32(units[i + 1] | (units[i + 2] << 16))
+            else:
+                rel = 0
+            record.update(kind="goto", target=i + rel)
+        elif opcode in {0x2B, 0x2C} and i + 2 < len(units):
+            register = (units[i] >> 8) & 0xFF
+            payload_rel = _signed32(units[i + 1] | (units[i + 2] << 16))
+            payload_offset = i + payload_rel
+            record.update(
+                kind="switch",
+                register=register,
+                switch_kind="packed" if opcode == 0x2B else "sparse",
+                payload_offset=payload_offset,
+                cases=_switch_cases(units, i, payload_offset),
+            )
+        elif 0x52 <= opcode <= 0x58 and i + 1 < len(units):
+            field_index = units[i + 1]
+            if field_index < len(dex.fields):
+                record.update(
+                    kind="iget",
+                    dest=(units[i] >> 8) & 0xF,
+                    object=(units[i] >> 12) & 0xF,
+                    field=dex.fields[field_index].full_name,
+                    field_descriptor=dex.fields[field_index].descriptor,
+                )
+        elif 0x59 <= opcode <= 0x5F and i + 1 < len(units):
+            field_index = units[i + 1]
+            if field_index < len(dex.fields):
+                record.update(
+                    kind="iput",
+                    source=(units[i] >> 8) & 0xF,
+                    object=(units[i] >> 12) & 0xF,
+                    field=dex.fields[field_index].full_name,
+                    field_descriptor=dex.fields[field_index].descriptor,
+                )
+        elif 0x60 <= opcode <= 0x66 and i + 1 < len(units):
+            field_index = units[i + 1]
+            if field_index < len(dex.fields):
+                record.update(
+                    kind="sget",
+                    dest=(units[i] >> 8) & 0xFF,
+                    field=dex.fields[field_index].full_name,
+                    field_descriptor=dex.fields[field_index].descriptor,
+                )
+        elif 0x67 <= opcode <= 0x6D and i + 1 < len(units):
+            field_index = units[i + 1]
+            if field_index < len(dex.fields):
+                record.update(
+                    kind="sput",
+                    source=(units[i] >> 8) & 0xFF,
+                    field=dex.fields[field_index].full_name,
+                    field_descriptor=dex.fields[field_index].descriptor,
+                )
         elif (0x6E <= opcode <= 0x72) or (0x74 <= opcode <= 0x78) or opcode in {0xFA, 0xFB}:
             if i + 1 < len(units):
                 method_index = units[i + 1]
@@ -561,6 +686,8 @@ def _decode_dispatch_records(dex: DexFile, code: MethodCode) -> list[dict]:
                         kind="invoke",
                         method=dex.methods[method_index].full_name,
                         registers=_invoke_registers(units, i, opcode),
+                        invoke_opcode=opcode,
+                        invoke_static=opcode in {0x71, 0x77},
                     )
         records.append(record)
         i += width
