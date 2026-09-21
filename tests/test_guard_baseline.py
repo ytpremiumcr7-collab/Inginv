@@ -55,3 +55,23 @@ def test_baseline_is_pinned_to_exact_blob_and_invalidates_on_change(tmp_path: Pa
     changed = scan_repository(tmp_path)
     assert changed["blocking_count"] == 1
     assert changed["baselined_count"] == 0
+
+
+def test_history_scan_includes_commit_messages(tmp_path: Path):
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "test@example.invalid")
+    _git(tmp_path, "config", "user.name", "Test")
+    tracked = tmp_path / "clean.txt"
+    tracked.write_text("clean=true\n", encoding="utf-8")
+    _git(tmp_path, "add", "clean.txt")
+    key = "pass" + "word"
+    message = key + "=" + ("9" * 6)
+    _git(tmp_path, "commit", "-qm", message)
+
+    report = scan_repository(tmp_path, history=True, baseline_file=None)
+    commit_findings = [
+        finding for finding in report["findings"]
+        if finding["path"].startswith("<commit-message:")
+    ]
+    assert any(f["rule"] == "HARDCODED_CREDENTIAL" for f in commit_findings)
+    assert message not in str(report)
