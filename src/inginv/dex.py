@@ -24,12 +24,27 @@ class MethodRef:
         return f"{self.owner}->{self.name}{self.descriptor}"
 
 
+@dataclass(frozen=True)
+class FieldRef:
+    index: int
+    owner: str
+    name: str
+    descriptor: str
+
+    @property
+    def full_name(self) -> str:
+        return f"{self.owner}->{self.name}:{self.descriptor}"
+
+
 @dataclass
 class MethodCode:
     method: MethodRef
     code_off: int
     strings: set[str] = field(default_factory=set)
     calls: set[int] = field(default_factory=set)
+    access_flags: int = 0
+    registers_size: int = 0
+    ins_size: int = 0
 
 
 SINK_PATTERNS: tuple[tuple[str, str], ...] = (
@@ -189,6 +204,7 @@ class DexFile:
         self.strings: list[str] = []
         self.types: list[str] = []
         self.methods: list[MethodRef] = []
+        self.fields: list[FieldRef] = []
         self.code: dict[int, MethodCode] = {}
         self.class_supertypes: dict[str, set[str]] = {}
         self._parse()
@@ -205,12 +221,14 @@ class DexFile:
         string_ids_size, string_ids_off = _u32(data, 56), _u32(data, 60)
         type_ids_size, type_ids_off = _u32(data, 64), _u32(data, 68)
         proto_ids_size, proto_ids_off = _u32(data, 72), _u32(data, 76)
+        field_ids_size, field_ids_off = _u32(data, 80), _u32(data, 84)
         method_ids_size, method_ids_off = _u32(data, 88), _u32(data, 92)
         class_defs_size, class_defs_off = _u32(data, 96), _u32(data, 100)
 
         self._check_table(string_ids_off, string_ids_size, 4)
         self._check_table(type_ids_off, type_ids_size, 4)
         self._check_table(proto_ids_off, proto_ids_size, 12)
+        self._check_table(field_ids_off, field_ids_size, 8)
         self._check_table(method_ids_off, method_ids_size, 8)
         self._check_table(class_defs_off, class_defs_size, 32)
 
@@ -229,6 +247,20 @@ class DexFile:
                 raise DexError("return type index out of range")
             params = _type_list(data, parameters_off, self.types)
             protos.append("(" + "".join(params) + ")" + self.types[return_type_idx])
+
+        for i in range(field_ids_size):
+            off = field_ids_off + i * 8
+            class_idx = _u16(data, off)
+            type_idx = _u16(data, off + 2)
+            name_idx = _u32(data, off + 4)
+            if class_idx >= len(self.types) or type_idx >= len(self.types):
+                raise DexError("field id references out-of-range type")
+            self.fields.append(FieldRef(
+                index=i,
+                owner=self.types[class_idx],
+                name=self._string(name_idx),
+                descriptor=self.types[type_idx],
+            ))
 
         for i in range(method_ids_size):
             off = method_ids_off + i * 8
@@ -293,17 +325,21 @@ class DexFile:
             method_index = 0
             for _ in range(count):
                 diff, off = _uleb(data, off)
-                _, off = _uleb(data, off)
+                access_flags, off = _uleb(data, off)
                 code_off, off = _uleb(data, off)
                 method_index += diff
                 if method_index >= len(self.methods):
                     raise DexError("encoded method index out of range")
                 if code_off:
-                    self.code[method_index] = self._parse_code_item(method_index, code_off)
+                    self.code[method_index] = self._parse_code_item(
+                        method_index, code_off, access_flags
+                    )
 
-    def _parse_code_item(self, method_index: int, off: int) -> MethodCode:
+    def _parse_code_item(self, method_index: int, off: int, access_flags: int = 0) -> MethodCode:
         if off + 16 > len(self.data):
             raise DexError("code_item outside file")
+        registers_size = _u16(self.data, off)
+        ins_size = _u16(self.data, off + 2)
         insns_size = _u32(self.data, off + 12)
         insns_off = off + 16
         end = insns_off + insns_size * 2
@@ -311,7 +347,15 @@ class DexFile:
             raise DexError("instruction stream outside file")
         units = list(struct.unpack_from(f"<{insns_size}H", self.data, insns_off)) if insns_size else []
         string_refs, calls = decode_code_units(units, self.strings, self.methods)
-        return MethodCode(self.methods[method_index], off, string_refs, calls)
+        return MethodCode(
+            self.methods[method_index],
+            off,
+            string_refs,
+            calls,
+            access_flags=access_flags,
+            registers_size=registers_size,
+            ins_size=ins_size,
+        )
 
 
 def _classify_owner(owner: str, first_party_prefixes: tuple[str, ...]) -> str:
@@ -424,7 +468,9 @@ def _add_polymorphic_edges(
     supertypes: dict[str, set[str]],
     *,
     max_candidates_per_signature: int = 64,
+    excluded_target_owners: set[str] | None = None,
 ) -> int:
+    excluded_target_owners = excluded_target_owners or set()
     implementations: dict[tuple[str, str], list[str]] = {}
     for full in code_methods:
         _, name, descriptor = _method_parts(full)
@@ -435,6 +481,8 @@ def _add_polymorphic_edges(
     callees = {callee for values in graph.values() for callee in values}
     for callee in sorted(callees):
         target_owner, name, descriptor = _method_parts(callee)
+        if target_owner in excluded_target_owners:
+            continue
         if target_owner not in supertypes:
             continue
         candidates = implementations.get((name, descriptor), ())
@@ -450,8 +498,44 @@ def _add_polymorphic_edges(
     return added
 
 
+def _signed8(value: int) -> int:
+    return value - 0x100 if value & 0x80 else value
+
+
 def _signed16(value: int) -> int:
     return value - 0x10000 if value & 0x8000 else value
+
+
+def _signed32(value: int) -> int:
+    return value - 0x100000000 if value & 0x80000000 else value
+
+
+def _switch_cases(units: list[int], switch_offset: int, payload_offset: int) -> dict[int, int]:
+    if payload_offset < 0 or payload_offset + 2 > len(units):
+        return {}
+    ident = units[payload_offset]
+    size = units[payload_offset + 1]
+    cases: dict[int, int] = {}
+    if ident == 0x0100:
+        if payload_offset + 4 + size * 2 > len(units):
+            return {}
+        first = _signed32(units[payload_offset + 2] | (units[payload_offset + 3] << 16))
+        pos = payload_offset + 4
+        for index in range(size):
+            rel = _signed32(units[pos + index * 2] | (units[pos + index * 2 + 1] << 16))
+            cases[first + index] = switch_offset + rel
+        return cases
+    if ident == 0x0200:
+        keys_start = payload_offset + 2
+        targets_start = keys_start + size * 2
+        if targets_start + size * 2 > len(units):
+            return {}
+        for index in range(size):
+            key = _signed32(units[keys_start + index * 2] | (units[keys_start + index * 2 + 1] << 16))
+            rel = _signed32(units[targets_start + index * 2] | (units[targets_start + index * 2 + 1] << 16))
+            cases[key] = switch_offset + rel
+        return cases
+    return {}
 
 
 def _invoke_registers(units: list[int], index: int, opcode: int) -> list[int]:
@@ -496,10 +580,36 @@ def _decode_dispatch_records(dex: DexFile, code: MethodCode) -> list[dict]:
                 register=(units[i] >> 8) & 0xFF,
                 string_index=units[i + 1] | (units[i + 2] << 16),
             )
+        elif opcode == 0x12:
+            register = (units[i] >> 8) & 0xF
+            raw_literal = (units[i] >> 12) & 0xF
+            literal = raw_literal - 16 if raw_literal & 0x8 else raw_literal
+            record.update(kind="const-int", register=register, value=literal)
+        elif opcode == 0x13 and i + 1 < len(units):
+            record.update(kind="const-int", register=(units[i] >> 8) & 0xFF, value=_signed16(units[i + 1]))
+        elif opcode == 0x14 and i + 2 < len(units):
+            value = _signed32(units[i + 1] | (units[i + 2] << 16))
+            record.update(kind="const-int", register=(units[i] >> 8) & 0xFF, value=value)
+        elif opcode == 0x15 and i + 1 < len(units):
+            record.update(
+                kind="const-int",
+                register=(units[i] >> 8) & 0xFF,
+                value=_signed16(units[i + 1]) << 16,
+            )
         elif opcode == 0x22 and i + 1 < len(units):
             type_index = units[i + 1]
             if type_index < len(dex.types):
                 record.update(kind="new-instance", register=(units[i] >> 8) & 0xFF, type=dex.types[type_index])
+        elif opcode in {0x01, 0x04, 0x07}:
+            record.update(
+                kind="move",
+                dest=(units[i] >> 8) & 0xF,
+                source=(units[i] >> 12) & 0xF,
+            )
+        elif opcode in {0x02, 0x05, 0x08} and i + 1 < len(units):
+            record.update(kind="move", dest=(units[i] >> 8) & 0xFF, source=units[i + 1])
+        elif opcode in {0x03, 0x06, 0x09} and i + 2 < len(units):
+            record.update(kind="move", dest=units[i + 1], source=units[i + 2])
         elif opcode in {0x0A, 0x0B, 0x0C}:
             record.update(kind="move-result", register=(units[i] >> 8) & 0xFF)
         elif opcode in {0x38, 0x39} and i + 1 < len(units):
@@ -509,6 +619,65 @@ def _decode_dispatch_records(dex: DexFile, code: MethodCode) -> list[dict]:
                 condition="eqz" if opcode == 0x38 else "nez",
                 target=i + _signed16(units[i + 1]),
             )
+        elif opcode in {0x28, 0x29, 0x2A}:
+            if opcode == 0x28:
+                rel = _signed8((units[i] >> 8) & 0xFF)
+            elif opcode == 0x29 and i + 1 < len(units):
+                rel = _signed16(units[i + 1])
+            elif i + 2 < len(units):
+                rel = _signed32(units[i + 1] | (units[i + 2] << 16))
+            else:
+                rel = 0
+            record.update(kind="goto", target=i + rel)
+        elif opcode in {0x2B, 0x2C} and i + 2 < len(units):
+            register = (units[i] >> 8) & 0xFF
+            payload_rel = _signed32(units[i + 1] | (units[i + 2] << 16))
+            payload_offset = i + payload_rel
+            record.update(
+                kind="switch",
+                register=register,
+                switch_kind="packed" if opcode == 0x2B else "sparse",
+                payload_offset=payload_offset,
+                cases=_switch_cases(units, i, payload_offset),
+            )
+        elif 0x52 <= opcode <= 0x58 and i + 1 < len(units):
+            field_index = units[i + 1]
+            if field_index < len(dex.fields):
+                record.update(
+                    kind="iget",
+                    dest=(units[i] >> 8) & 0xF,
+                    object=(units[i] >> 12) & 0xF,
+                    field=dex.fields[field_index].full_name,
+                    field_descriptor=dex.fields[field_index].descriptor,
+                )
+        elif 0x59 <= opcode <= 0x5F and i + 1 < len(units):
+            field_index = units[i + 1]
+            if field_index < len(dex.fields):
+                record.update(
+                    kind="iput",
+                    source=(units[i] >> 8) & 0xF,
+                    object=(units[i] >> 12) & 0xF,
+                    field=dex.fields[field_index].full_name,
+                    field_descriptor=dex.fields[field_index].descriptor,
+                )
+        elif 0x60 <= opcode <= 0x66 and i + 1 < len(units):
+            field_index = units[i + 1]
+            if field_index < len(dex.fields):
+                record.update(
+                    kind="sget",
+                    dest=(units[i] >> 8) & 0xFF,
+                    field=dex.fields[field_index].full_name,
+                    field_descriptor=dex.fields[field_index].descriptor,
+                )
+        elif 0x67 <= opcode <= 0x6D and i + 1 < len(units):
+            field_index = units[i + 1]
+            if field_index < len(dex.fields):
+                record.update(
+                    kind="sput",
+                    source=(units[i] >> 8) & 0xFF,
+                    field=dex.fields[field_index].full_name,
+                    field_descriptor=dex.fields[field_index].descriptor,
+                )
         elif (0x6E <= opcode <= 0x72) or (0x74 <= opcode <= 0x78) or opcode in {0xFA, 0xFB}:
             if i + 1 < len(units):
                 method_index = units[i + 1]
@@ -517,16 +686,95 @@ def _decode_dispatch_records(dex: DexFile, code: MethodCode) -> list[dict]:
                         kind="invoke",
                         method=dex.methods[method_index].full_name,
                         registers=_invoke_registers(units, i, opcode),
+                        invoke_opcode=opcode,
+                        invoke_static=opcode in {0x71, 0x77},
                     )
         records.append(record)
         i += width
     return records
 
 
-def _discover_dispatches_in_method(dex: DexFile, code: MethodCode) -> list[dict]:
+def _record_by_offset(records: list[dict]) -> dict[int, dict]:
+    return {record["offset"]: record for record in records}
+
+
+def _find_const_assignment(
+    records_by_offset: dict[int, dict],
+    start_offset: int,
+    *,
+    max_steps: int = 8,
+) -> tuple[int, int] | None:
+    """Follow a tiny straight-line/goto block to find the case discriminator."""
+    offset = start_offset
+    seen: set[int] = set()
+    for _ in range(max_steps):
+        if offset in seen:
+            return None
+        seen.add(offset)
+        record = records_by_offset.get(offset)
+        if record is None:
+            return None
+        if record.get("kind") == "const-int":
+            return int(record["register"]), int(record["value"])
+        if record.get("kind") == "goto":
+            offset = int(record["target"])
+            continue
+        if record.get("kind") in {"invoke", "move-result", "move", "const-string"}:
+            offset = record["offset"] + record["width"]
+            continue
+        return None
+    return None
+
+
+def _case_new_instances(
+    records_by_offset: dict[int, dict],
+    start_offset: int,
+    case_targets: set[int],
+    executable_owners: set[str],
+    *,
+    max_steps: int = 24,
+) -> list[str]:
+    task_types: list[str] = []
+    offset = start_offset
+    seen: set[int] = set()
+    for _ in range(max_steps):
+        if offset in seen:
+            break
+        seen.add(offset)
+        if offset != start_offset and offset in case_targets:
+            break
+        record = records_by_offset.get(offset)
+        if record is None:
+            break
+        kind = record.get("kind")
+        if kind == "new-instance":
+            type_name = record.get("type")
+            if isinstance(type_name, str) and type_name in executable_owners:
+                task_types.append(type_name)
+        if kind == "goto":
+            break
+        offset = record["offset"] + record["width"]
+    return sorted(set(task_types))
+
+
+def _discover_dispatches_in_method(
+    dex: DexFile,
+    code: MethodCode,
+    executable_owners: set[str] | None = None,
+) -> list[dict]:
     records = _decode_dispatch_records(dex, code)
+    by_offset = _record_by_offset(records)
     command_names = {command.lower(): command for command in COMMAND_HINTS}
     discoveries: list[dict] = []
+    filter_executable_types = executable_owners is not None
+    if executable_owners is None:
+        executable_owners = {
+            method.owner
+            for method in dex.methods
+            if method.name in {"execute", "run"}
+        }
+
+    switches = [record for record in records if record.get("kind") == "switch"]
 
     for pos, record in enumerate(records):
         if record.get("kind") != "const-string":
@@ -569,41 +817,84 @@ def _discover_dispatches_in_method(dex: DexFile, code: MethodCode) -> list[dict]
         if branch.get("kind") != "if-testz" or branch.get("register") != result_reg:
             continue
 
-        success_start = branch["offset"] + branch["width"]
-        success_end = branch["target"] if branch["condition"] == "eqz" else None
+        success_start = (
+            int(branch["target"])
+            if branch["condition"] == "nez"
+            else int(branch["offset"] + branch["width"])
+        )
+        assignment = _find_const_assignment(by_offset, success_start)
         task_types: list[str] = []
+        discriminator: int | None = None
+        discriminator_register: int | None = None
+        switch_kind: str | None = None
+        switch_offset: int | None = None
 
-        if success_end is not None and success_end > success_start:
+        if assignment is not None:
+            discriminator_register, discriminator = assignment
+            candidate_switches = [
+                switch for switch in switches
+                if switch["offset"] > success_start
+                and switch.get("register") == discriminator_register
+                and discriminator in switch.get("cases", {})
+            ]
+            if candidate_switches:
+                second_switch = min(candidate_switches, key=lambda item: item["offset"])
+                switch_kind = str(second_switch.get("switch_kind"))
+                switch_offset = int(second_switch["offset"])
+                target = int(second_switch["cases"][discriminator])
+                case_targets = {int(value) for value in second_switch.get("cases", {}).values()}
+                task_types = _case_new_instances(
+                    by_offset, target, case_targets, executable_owners
+                )
+
+        if not task_types and assignment is None and branch["condition"] == "eqz":
+            success_end = int(branch["target"])
             for candidate in records:
                 if not (success_start <= candidate["offset"] < success_end):
                     continue
                 if candidate.get("kind") == "new-instance":
                     type_name = candidate.get("type")
-                    if isinstance(type_name, str):
+                    if isinstance(type_name, str) and (
+                        not filter_executable_types or type_name in executable_owners
+                    ):
                         task_types.append(type_name)
 
+        confidence = "high" if task_types else "partial"
+        note = (
+            "command equals branch assigns a discriminator consumed by a second switch whose case constructs a concrete executable task"
+            if task_types and discriminator is not None and switch_offset is not None
+            else "command const-string feeds String.equals; matching branch contains concrete executable new-instance"
+            if task_types
+            else "command comparison identified, but concrete executable task construction was not resolved"
+        )
         discoveries.append({
             "command": command,
             "dispatcher": code.method.full_name,
             "comparison": records[invoke_pos]["method"],
             "branch_condition": branch["condition"],
             "branch_target_code_unit": branch["target"],
+            "discriminator_register": discriminator_register,
+            "discriminator": discriminator,
+            "second_switch_kind": switch_kind,
+            "second_switch_code_unit": switch_offset,
             "task_types": sorted(set(task_types)),
-            "confidence": "high" if task_types else "partial",
-            "evidence_note": (
-                "command const-string feeds String.equals; matching branch contains concrete new-instance"
-                if task_types else
-                "command comparison identified, but concrete task construction was not resolved"
-            ),
+            "confidence": confidence,
+            "evidence_note": note,
         })
     return discoveries
 
 
 def _discover_task_dispatches(dexes: list[DexFile]) -> list[dict]:
+    executable_owners = {
+        method.owner
+        for dex in dexes
+        for method in dex.methods
+        if method.name in {"execute", "run"}
+    }
     discoveries: list[dict] = []
     for dex in dexes:
         for code in dex.code.values():
-            discoveries.extend(_discover_dispatches_in_method(dex, code))
+            discoveries.extend(_discover_dispatches_in_method(dex, code, executable_owners))
 
     unique: dict[tuple, dict] = {}
     for item in discoveries:
@@ -612,10 +903,303 @@ def _discover_task_dispatches(dexes: list[DexFile]) -> list[dict]:
             item["dispatcher"],
             tuple(item["task_types"]),
             item["branch_target_code_unit"],
+            item.get("discriminator"),
         )
         unique[key] = item
     return sorted(unique.values(), key=lambda x: (x["command"], x["dispatcher"], x["task_types"]))
 
+
+
+ACC_STATIC = 0x0008
+RUNNABLE_TYPE = "Ljava/lang/Runnable;"
+THREAD_TYPE = "Ljava/lang/Thread;"
+OKDOWNLOAD_LISTENER = "Lcom/liulishuo/okdownload/DownloadListener;"
+OKDOWNLOAD_TASK_EXECUTE = (
+    "Lcom/liulishuo/okdownload/DownloadTask;->execute("
+    "Lcom/liulishuo/okdownload/DownloadListener;)V"
+)
+OKDOWNLOAD_BUNCH_APPEND = (
+    "Lcom/liulishuo/okdownload/core/listener/DownloadListenerBunch$Builder;->append("
+    "Lcom/liulishuo/okdownload/DownloadListener;)"
+    "Lcom/liulishuo/okdownload/core/listener/DownloadListenerBunch$Builder;"
+)
+ASYNC_METHOD_NAMES = {"add", "execute", "submit", "post", "postDelayed"}
+
+
+def _descriptor_parameter_types(descriptor: str) -> list[str]:
+    if not descriptor.startswith("(") or ")" not in descriptor:
+        return []
+    end = descriptor.index(")")
+    params = descriptor[1:end]
+    result: list[str] = []
+    i = 0
+    while i < len(params):
+        start = i
+        while i < len(params) and params[i] == "[":
+            i += 1
+        if i >= len(params):
+            break
+        if params[i] == "L":
+            semi = params.find(";", i)
+            if semi < 0:
+                break
+            i = semi + 1
+        else:
+            i += 1
+        result.append(params[start:i])
+    return result
+
+
+def _method_descriptor(full_name: str) -> str:
+    return "(" + full_name.split("(", 1)[1]
+
+
+def _method_return_type(full_name: str) -> str:
+    descriptor = _method_descriptor(full_name)
+    return descriptor.split(")", 1)[1]
+
+
+def _is_reference_type(descriptor: str) -> bool:
+    return descriptor.startswith("L") or descriptor.startswith("[")
+
+
+def _initial_register_types(code: MethodCode) -> dict[int, set[str]]:
+    if code.registers_size <= 0 or code.ins_size <= 0:
+        return {}
+    base = code.registers_size - code.ins_size
+    cursor = base
+    result: dict[int, set[str]] = {}
+    if not (code.access_flags & ACC_STATIC):
+        result[cursor] = {code.method.owner}
+        cursor += 1
+    for parameter in _descriptor_parameter_types(code.method.descriptor):
+        if _is_reference_type(parameter):
+            result[cursor] = {parameter}
+        cursor += 2 if parameter in {"J", "D"} else 1
+    return result
+
+
+def _scan_method_types(
+    dex: DexFile,
+    code: MethodCode,
+    field_types: dict[str, set[str]],
+) -> tuple[list[dict], bool]:
+    records = _decode_dispatch_records(dex, code)
+    reg_types = _initial_register_types(code)
+    pending_result: set[str] | None = None
+    invocations: list[dict] = []
+    changed = False
+
+    for record in records:
+        kind = record.get("kind")
+        if kind != "move-result" and pending_result is not None:
+            pending_result = None
+
+        if kind == "new-instance":
+            type_name = record.get("type")
+            if isinstance(type_name, str):
+                reg_types[int(record["register"])] = {type_name}
+        elif kind == "move":
+            reg_types[int(record["dest"])] = set(reg_types.get(int(record["source"]), set()))
+        elif kind in {"iget", "sget"}:
+            field_name = str(record["field"])
+            types = set(field_types.get(field_name, set()))
+            descriptor = str(record.get("field_descriptor", ""))
+            if not types and _is_reference_type(descriptor):
+                types.add(descriptor)
+            reg_types[int(record["dest"])] = types
+        elif kind in {"iput", "sput"}:
+            field_name = str(record["field"])
+            source_types = set(reg_types.get(int(record["source"]), set()))
+            if source_types:
+                previous = set(field_types.get(field_name, set()))
+                merged = previous | source_types
+                if merged != previous:
+                    field_types[field_name] = merged
+                    changed = True
+        elif kind == "invoke":
+            regs = [int(value) for value in record.get("registers", [])]
+            is_static = bool(record.get("invoke_static"))
+            argument_regs = regs if is_static else regs[1:]
+            receiver_regs = [] if is_static or not regs else [regs[0]]
+            invocations.append({
+                "caller": code.method.full_name,
+                "callee": record["method"],
+                "argument_regs": argument_regs,
+                "argument_types": [set(reg_types.get(reg, set())) for reg in argument_regs],
+                "receiver_types": (
+                    set(reg_types.get(receiver_regs[0], set())) if receiver_regs else set()
+                ),
+                "offset": record["offset"],
+            })
+            return_type = _method_return_type(str(record["method"]))
+            pending_result = {return_type} if _is_reference_type(return_type) else set()
+        elif kind == "move-result":
+            reg_types[int(record["register"])] = set(pending_result or set())
+            pending_result = None
+
+    return invocations, changed
+
+
+def _reachable_interface_callbacks(
+    seed: str,
+    graph: dict[str, set[str]],
+    interface_owner: str,
+    *,
+    max_depth: int = 8,
+) -> set[str]:
+    queue: list[tuple[str, int]] = [(seed, 0)]
+    seen = {seed}
+    result: set[str] = set()
+    while queue:
+        current, depth = queue.pop(0)
+        if depth >= max_depth:
+            continue
+        for callee in graph.get(current, ()):
+            if callee.startswith(interface_owner + "->"):
+                result.add(callee)
+            if callee not in seen:
+                seen.add(callee)
+                queue.append((callee, depth + 1))
+    return result
+
+
+def _add_bound_async_and_callback_edges(
+    dexes: list[DexFile],
+    code_records: list[tuple[DexFile, MethodCode]],
+    graph: dict[str, set[str]],
+    supertypes: dict[str, set[str]],
+) -> tuple[list[dict], list[dict], set[str]]:
+    """Add allocation/binding-backed asynchronous summary edges only."""
+    code_methods = {code.method.full_name for _, code in code_records}
+    record_by_name = {code.method.full_name: (dex, code) for dex, code in code_records}
+    async_edges: list[dict] = []
+    callback_edges: list[dict] = []
+
+    async_candidates: list[tuple[DexFile, MethodCode]] = []
+    for dex, code in code_records:
+        for callee_index in code.calls:
+            if callee_index >= len(dex.methods):
+                continue
+            callee = dex.methods[callee_index].full_name
+            _, name, descriptor = _method_parts(callee)
+            if (
+                (name in ASYNC_METHOD_NAMES and RUNNABLE_TYPE in _descriptor_parameter_types(descriptor))
+                or (name == "start" and descriptor == "()V")
+            ):
+                async_candidates.append((dex, code))
+                break
+
+    runnable_cache: dict[tuple[str, str], bool] = {}
+    thread_cache: dict[tuple[str, str], bool] = {}
+    for dex, code in async_candidates:
+        invocations, _ = _scan_method_types(dex, code, {})
+        caller = code.method.full_name
+        for invocation in invocations:
+            callee = str(invocation["callee"])
+            _, name, descriptor = _method_parts(callee)
+            params = _descriptor_parameter_types(descriptor)
+            arg_types = invocation["argument_types"]
+
+            if name in ASYNC_METHOD_NAMES:
+                for index, parameter in enumerate(params):
+                    if parameter != RUNNABLE_TYPE or index >= len(arg_types):
+                        continue
+                    for candidate in sorted(arg_types[index]):
+                        if not _is_subtype(candidate, RUNNABLE_TYPE, supertypes, runnable_cache):
+                            continue
+                        run_method = candidate + "->run()V"
+                        if run_method not in code_methods:
+                            continue
+                        if run_method not in graph.setdefault(caller, set()):
+                            graph[caller].add(run_method)
+                            async_edges.append({
+                                "caller": caller,
+                                "dispatch": callee,
+                                "callback": run_method,
+                                "evidence": "concrete Runnable type proven in dispatch argument register",
+                            })
+
+            if name == "start" and descriptor == "()V":
+                for candidate in sorted(invocation["receiver_types"]):
+                    if not _is_subtype(candidate, THREAD_TYPE, supertypes, thread_cache):
+                        continue
+                    run_method = candidate + "->run()V"
+                    if run_method in code_methods and run_method not in graph.setdefault(caller, set()):
+                        graph[caller].add(run_method)
+                        async_edges.append({
+                            "caller": caller,
+                            "dispatch": callee,
+                            "callback": run_method,
+                            "evidence": "concrete Thread receiver proven at start() callsite",
+                        })
+
+    wrapper_execute_sites: list[tuple[str, str]] = []
+    wrapper_has_bunch_append: set[str] = set()
+    wrapper_owners: set[str] = set()
+    for caller, callees in graph.items():
+        owner = _owner_from_full_name(caller)
+        if OKDOWNLOAD_TASK_EXECUTE in callees:
+            wrapper_execute_sites.append((owner, caller))
+            wrapper_owners.add(owner)
+        if caller.startswith(owner + "-><init>(") and OKDOWNLOAD_BUNCH_APPEND in callees:
+            wrapper_has_bunch_append.add(owner)
+
+    wrapper_listener_types: dict[str, set[str]] = {}
+    listener_cache: dict[tuple[str, str], bool] = {}
+    for wrapper_owner in sorted(wrapper_owners):
+        constructor_prefix = wrapper_owner + "-><init>("
+        for caller, callees in graph.items():
+            if not any(callee.startswith(constructor_prefix) for callee in callees):
+                continue
+            pair = record_by_name.get(caller)
+            if pair is None:
+                continue
+            dex, code = pair
+            invocations, _ = _scan_method_types(dex, code, {})
+            for invocation in invocations:
+                callee = str(invocation["callee"])
+                if not callee.startswith(constructor_prefix):
+                    continue
+                _, _, descriptor = _method_parts(callee)
+                params = _descriptor_parameter_types(descriptor)
+                for index, parameter in enumerate(params):
+                    if parameter != OKDOWNLOAD_LISTENER or index >= len(invocation["argument_types"]):
+                        continue
+                    for candidate in invocation["argument_types"][index]:
+                        if _is_subtype(candidate, OKDOWNLOAD_LISTENER, supertypes, listener_cache):
+                            wrapper_listener_types.setdefault(wrapper_owner, set()).add(candidate)
+
+    interface_callbacks = _reachable_interface_callbacks(
+        OKDOWNLOAD_TASK_EXECUTE, graph, OKDOWNLOAD_LISTENER
+    )
+    bound_interfaces: set[str] = set()
+    for wrapper_owner, caller in wrapper_execute_sites:
+        concrete_listeners = wrapper_listener_types.get(wrapper_owner, set())
+        if not concrete_listeners or wrapper_owner not in wrapper_has_bunch_append:
+            continue
+        for interface_callback in sorted(interface_callbacks):
+            _, callback_name, callback_descriptor = _method_parts(interface_callback)
+            for listener_type in sorted(concrete_listeners):
+                implementation = listener_type + "->" + callback_name + callback_descriptor
+                if implementation not in code_methods:
+                    continue
+                if implementation not in graph.setdefault(caller, set()):
+                    graph[caller].add(implementation)
+                    callback_edges.append({
+                        "caller": caller,
+                        "dispatch": OKDOWNLOAD_TASK_EXECUTE,
+                        "interface_callback": interface_callback,
+                        "callback": implementation,
+                        "binding_owner": wrapper_owner,
+                        "evidence": (
+                            "wrapper constructor receives concrete listener; constructor composes "
+                            "DownloadListenerBunch; wrapper dispatches through DownloadTask.execute"
+                        ),
+                    })
+                    bound_interfaces.add(OKDOWNLOAD_LISTENER)
+
+    return async_edges, callback_edges, bound_interfaces
 
 
 def trace_apk(
@@ -669,10 +1253,16 @@ def trace_apk(
                     graph[caller].add(dex.methods[callee_idx].full_name)
             code_records.append((dex, code))
 
+    async_edges, callback_edges, context_bound_interfaces = (
+        _add_bound_async_and_callback_edges(
+            dexes, code_records, graph, supertypes
+        )
+    )
     polymorphic_edges_added = _add_polymorphic_edges(
         graph,
         {code.method.full_name for _, code in code_records},
         supertypes,
+        excluded_target_owners=context_bound_interfaces,
     )
     task_dispatches = _discover_task_dispatches(dexes)
 
@@ -735,15 +1325,22 @@ def trace_apk(
         "unique_method_signature_count": len(unique_method_refs),
         "methods_with_code_count": len(code_records),
         "polymorphic_edges_added": polymorphic_edges_added,
+        "bound_async_edges_added": len(async_edges),
+        "bound_callback_edges_added": len(callback_edges),
+        "context_bound_interfaces": sorted(context_bound_interfaces),
         "first_party_prefixes": list(first_party_prefixes),
         "evidence_semantics": {
             "call_edge": "STATIC_CONFIRMED invocation reference; does not prove runtime execution",
             "command_seed": "method contains an exact const-string command identifier",
             "sink_path": "shortest static invoke path from command-seed method to privileged sink",
             "cross_dex": "method references are canonicalized by full Dalvik signature across DEX files",
-            "polymorphic_dispatch": "known app class/interface relationships add synthetic static dispatch edges",
-            "task_dispatch": "high-confidence mappings require const-string -> String.equals -> matching branch -> concrete new-instance",
+            "polymorphic_dispatch": "known app class/interface relationships add synthetic static dispatch edges, except interfaces with stronger contextual bindings",
+            "async_dispatch": "summary edge requires a concrete Runnable/Thread proven at the dispatch callsite; does not prove scheduling or execution",
+            "callback_binding": "summary edge requires a concrete listener constructor binding plus wrapper composition/dispatch evidence; does not prove callback execution",
+            "task_dispatch": "high-confidence mappings support direct equals branches and D8/R8 two-stage string-switch dispatch into concrete executable task types",
         },
+        "bound_async_edges": async_edges,
+        "bound_callback_edges": callback_edges,
         "task_dispatches": task_dispatches,
         "task_execute_paths": task_execute_paths,
         "command_paths": command_paths,
