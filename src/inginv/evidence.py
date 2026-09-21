@@ -48,6 +48,7 @@ class EvidenceRef:
 @dataclass(frozen=True)
 class Finding:
     finding_id: str
+    rule_id: str
     title: str
     category: str
     evidence_state: str
@@ -74,8 +75,8 @@ class Finding:
 
 
 def _canonical_identity(
+    rule_id: str,
     category: str,
-    title: str,
     evidence: Iterable[EvidenceRef],
 ) -> str:
     refs = sorted(
@@ -89,7 +90,7 @@ def _canonical_identity(
         for ref in evidence
     )
     payload = json.dumps(
-        {"category": category, "title": title, "evidence": refs},
+        {"rule_id": rule_id, "category": category, "evidence": refs},
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
@@ -98,16 +99,17 @@ def _canonical_identity(
 
 
 def stable_finding_id(
+    rule_id: str,
     category: str,
-    title: str,
     evidence: Iterable[EvidenceRef],
 ) -> str:
-    digest = sha256(_canonical_identity(category, title, evidence).encode("utf-8")).hexdigest()
+    digest = sha256(_canonical_identity(rule_id, category, evidence).encode("utf-8")).hexdigest()
     return f"ING-{digest[:20].upper()}"
 
 
 def make_finding(
     *,
+    rule_id: str,
     title: str,
     category: str,
     evidence_state: str,
@@ -121,9 +123,10 @@ def make_finding(
     metadata: dict[str, object] | None = None,
 ) -> Finding:
     refs = tuple(evidence)
-    finding_id = stable_finding_id(category, title, refs)
+    finding_id = stable_finding_id(rule_id, category, refs)
     return Finding(
         finding_id=finding_id,
+        rule_id=rule_id,
         title=title,
         category=category,
         evidence_state=evidence_state,
@@ -168,6 +171,7 @@ def _manifest_findings(model: dict) -> list[Finding]:
             detail="exported=true and no effective component/application access permission",
         )
         findings.append(make_finding(
+            rule_id="android.exported_without_access_permission",
             title=f"Exported Android {kind} without manifest access permission: {name}",
             category="android.exported-surface",
             evidence_state="STATIC_CONFIRMED",
@@ -223,6 +227,7 @@ def _dex_findings(trace: dict) -> list[Finding]:
                 ),
             ]
             findings.append(make_finding(
+                rule_id="android.privileged_command_path",
                 title=f"Privileged command path: {command} -> {sink}",
                 category="android.privileged-capability",
                 evidence_state="STATIC_CONFIRMED",
@@ -263,6 +268,7 @@ def _correlation_findings(correlation: dict) -> list[Finding]:
             ),
         )
         findings.append(make_finding(
+            rule_id=f"analysis.correlation.{correlation_id}",
             title=f"Static/runtime correlation: {correlation_id}",
             category="analysis.correlation",
             evidence_state=state if state in EVIDENCE_STATES else "UNVERIFIED",
@@ -329,19 +335,20 @@ def report_markdown(report: dict) -> str:
     lines = [
         "# Inginv findings report",
         "",
-        f"Schema: `{safe.get('schema', 'unknown')}`  ",
-        f"Generated: `{safe.get('generated_at', 'unknown')}`  ",
-        f"Findings: **{safe.get('finding_count', 0)}**",
+        f"Schema: `{_md(safe.get('schema', 'unknown'))}`  ",
+        f"Generated: `{_md(safe.get('generated_at', 'unknown'))}`  ",
+        f"Findings: **{_md(safe.get('finding_count', 0))}**",
         "",
     ]
     for finding in safe.get("findings", []):
         lines.extend([
             f"## {_md(finding['finding_id'])} — {_md(finding['title'])}",
             "",
-            f"- Evidence state: `{finding['evidence_state']}`",
-            f"- Severity: `{finding['severity']}`",
-            f"- Confidence: `{finding['confidence']}`",
-            f"- Category: `{finding['category']}`",
+            f"- Rule: `{_md(finding['rule_id'])}`",
+            f"- Evidence state: `{_md(finding['evidence_state'])}`",
+            f"- Severity: `{_md(finding['severity'])}`",
+            f"- Confidence: `{_md(finding['confidence'])}`",
+            f"- Category: `{_md(finding['category'])}`",
             "",
             f"**Consequence:** {_md(finding['consequence'])}",
             "",
@@ -353,8 +360,10 @@ def report_markdown(report: dict) -> str:
         ])
         for ref in finding["evidence"]:
             artifact = ref.get("artifact_sha256")
-            suffix = f" (artifact `{artifact}`)" if artifact else ""
-            lines.append(f"- `{ref['locator']}` via `{ref['source']}`{suffix}")
+            suffix = f" (artifact `{_md(artifact)}`)" if artifact else ""
+            lines.append(
+                f"- `{_md(ref['locator'])}` via `{_md(ref['source'])}`{suffix}"
+            )
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
