@@ -153,3 +153,111 @@ def test_required_privileged_sink_regressions(sink_method, expected_sink):
     assert paths
     assert paths[0]["sink"] == expected_sink
     assert paths[0]["path"][-1] == sink_method
+
+
+
+def test_d8_two_stage_string_switch_resolves_concrete_task():
+    import struct
+    from types import SimpleNamespace
+    from inginv.dex import MethodCode, _discover_dispatches_in_method
+
+    equals = MethodRef(0, "Ljava/lang/String;", "equals", "(Ljava/lang/Object;)Z")
+    dispatcher = MethodRef(1, "Lapp/PolicyBroker;", "takeOrder", "()V")
+    units = [
+        0x061A, 0x0000,
+        0x206E, 0x0000, 0x0064,
+        0x040A,
+        0x0439, 0x0004,
+        0x0029, 0x0004,
+        0x0512,
+        0x0128,
+        0x052B, 0x000A, 0x0000,
+        0x0529, 0x0000,
+        0x0322, 0x0000,
+        0x0128,
+        0x000E,
+        0x0000,
+        0x0100, 0x0001,
+        0x0000, 0x0000,
+        0x0005, 0x0000,
+    ]
+    data = bytearray(16 + len(units) * 2)
+    struct.pack_into("<I", data, 12, len(units))
+    struct.pack_into(f"<{len(units)}H", data, 16, *units)
+    dex = SimpleNamespace(
+        data=bytes(data),
+        strings=["reboot"],
+        types=["Lapp/RebootTask;"],
+        methods=[equals],
+    )
+    code = MethodCode(dispatcher, 0)
+    discoveries = _discover_dispatches_in_method(dex, code)
+    assert discoveries[0]["command"] == "reboot"
+    assert discoveries[0]["task_types"] == ["Lapp/RebootTask;"]
+    assert discoveries[0]["resolution"] == "string-switch"
+    assert discoveries[0]["confidence"] == "high"
+
+
+def test_concrete_runnable_scheduler_adds_only_type_proven_edge():
+    import struct
+    from types import SimpleNamespace
+    from inginv.dex import MethodCode, _add_runnable_dispatch_edges
+
+    ctor = MethodRef(0, "Lapp/Worker;", "<init>", "()V")
+    add = MethodRef(1, "Lapp/ThreadPool;", "add", "(Ljava/lang/Runnable;)Z")
+    caller = MethodRef(2, "Lapp/Manager;", "start", "()V")
+    units = [
+        0x0122, 0x0000,
+        0x1070, 0x0000, 0x0001,
+        0x206E, 0x0001, 0x0010,
+        0x000E,
+    ]
+    data = bytearray(16 + len(units) * 2)
+    struct.pack_into("<I", data, 12, len(units))
+    struct.pack_into(f"<{len(units)}H", data, 16, *units)
+    dex = SimpleNamespace(data=bytes(data), types=["Lapp/Worker;"], methods=[ctor, add])
+    code = MethodCode(caller, 0)
+    graph = {caller.full_name: set()}
+    edges = _add_runnable_dispatch_edges(
+        graph,
+        [(dex, code)],
+        {"Lapp/Worker;->run()V"},
+        {"Lapp/Worker;": {"Ljava/lang/Object;", "Ljava/lang/Runnable;"}},
+    )
+    assert graph[caller.full_name] == {"Lapp/Worker;->run()V"}
+    assert len(edges) == 1
+    assert edges[0]["runnable_type"] == "Lapp/Worker;"
+
+
+def test_scheduler_does_not_assume_run_method_means_runnable():
+    import struct
+    from types import SimpleNamespace
+    from inginv.dex import MethodCode, _add_runnable_dispatch_edges
+
+    ctor = MethodRef(0, "Lapp/NotRunnable;", "<init>", "()V")
+    add = MethodRef(1, "Lapp/ThreadPool;", "add", "(Ljava/lang/Runnable;)Z")
+    caller = MethodRef(2, "Lapp/Manager;", "start", "()V")
+    units = [
+        0x0122, 0x0000,
+        0x1070, 0x0000, 0x0001,
+        0x206E, 0x0001, 0x0010,
+        0x000E,
+    ]
+    data = bytearray(16 + len(units) * 2)
+    struct.pack_into("<I", data, 12, len(units))
+    struct.pack_into(f"<{len(units)}H", data, 16, *units)
+    dex = SimpleNamespace(
+        data=bytes(data),
+        types=["Lapp/NotRunnable;"],
+        methods=[ctor, add],
+    )
+    code = MethodCode(caller, 0)
+    graph = {caller.full_name: set()}
+    edges = _add_runnable_dispatch_edges(
+        graph,
+        [(dex, code)],
+        {"Lapp/NotRunnable;->run()V"},
+        {"Lapp/NotRunnable;": {"Ljava/lang/Object;"}},
+    )
+    assert not edges
+    assert not graph[caller.full_name]
