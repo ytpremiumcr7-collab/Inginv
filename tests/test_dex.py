@@ -153,3 +153,51 @@ def test_required_privileged_sink_regressions(sink_method, expected_sink):
     assert paths
     assert paths[0]["sink"] == expected_sink
     assert paths[0]["path"][-1] == sink_method
+
+
+def test_d8_two_stage_string_switch_resolves_concrete_task():
+    import struct
+    from types import SimpleNamespace
+    from inginv.dex import MethodCode, _discover_dispatches_in_method
+
+    equals = MethodRef(0, "Ljava/lang/String;", "equals", "(Ljava/lang/Object;)Z")
+    dispatcher = MethodRef(1, "Lapp/PolicyBroker;", "takeOrder", "()V")
+
+    units = [
+        0x011A, 0x0000,
+        0x206E, 0x0000, 0x0010,
+        0x020A,
+        0x0239, 0x0004,
+        0x0428,
+        0x0000,
+        0x0512,
+        0x0128,
+        0x052B, 0x0008, 0x0000,
+        0x0428,
+        0x0322, 0x0000,
+        0x000E,
+        0x000E,
+        0x0100, 0x0001,
+        0x0000, 0x0000,
+        0x0004, 0x0000,
+    ]
+    data = bytearray(16 + len(units) * 2)
+    struct.pack_into("<I", data, 12, len(units))
+    struct.pack_into(f"<{len(units)}H", data, 16, *units)
+
+    dex = SimpleNamespace(
+        data=bytes(data),
+        strings=["reboot"],
+        types=["Lapp/RebootTask;"],
+        fields=[],
+        methods=[equals, MethodRef(1, "Lapp/RebootTask;", "execute", "()V")],
+    )
+    code = MethodCode(dispatcher, 0)
+    discoveries = _discover_dispatches_in_method(
+        dex, code, {"Lapp/RebootTask;"}
+    )
+    assert discoveries[0]["command"] == "reboot"
+    assert discoveries[0]["discriminator"] == 0
+    assert discoveries[0]["second_switch_kind"] == "packed"
+    assert discoveries[0]["task_types"] == ["Lapp/RebootTask;"]
+    assert discoveries[0]["confidence"] == "high"
