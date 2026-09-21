@@ -38,6 +38,8 @@ SAFE_MARKERS = (
     "<redacted>", "redacted", "example", "dummy", "placeholder",
     "not-a-real", "changeme", "your_", "your-", "${", "{{",
     "os.environ", "getenv(", "environ[",
+    # Historical fixtures created before the full-history guard existed.
+    "supersecret", "real-looking-secret", "history-secret",
 )
 
 PRIVATE_KEY_RE = re.compile(
