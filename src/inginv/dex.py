@@ -450,8 +450,148 @@ def _add_polymorphic_edges(
     return added
 
 
+def _descriptor_parameters(descriptor: str) -> list[str]:
+    if not descriptor.startswith("("):
+        return []
+    params: list[str] = []
+    index = 1
+    while index < len(descriptor) and descriptor[index] != ")":
+        start = index
+        while index < len(descriptor) and descriptor[index] == "[":
+            index += 1
+        if index >= len(descriptor):
+            break
+        if descriptor[index] == "L":
+            end = descriptor.find(";", index)
+            if end < 0:
+                break
+            index = end + 1
+        else:
+            index += 1
+        params.append(descriptor[start:index])
+    return params
+
+
+def _invoke_argument_registers(record: dict) -> list[tuple[str, int]]:
+    method = record.get("method")
+    registers = list(record.get("registers", []))
+    opcode = record.get("opcode")
+    if not isinstance(method, str) or "->" not in method or "(" not in method:
+        return []
+    descriptor = "(" + method.split("(", 1)[1]
+    params = _descriptor_parameters(descriptor)
+    is_static = opcode in {0x71, 0x77}
+    reg_index = 0 if is_static else 1
+    result: list[tuple[str, int]] = []
+    for param in params:
+        if reg_index >= len(registers):
+            break
+        result.append((param, registers[reg_index]))
+        reg_index += 2 if param in {"J", "D"} else 1
+    return result
+
+
+def _add_runnable_dispatch_edges(
+    graph: dict[str, set[str]],
+    code_records: list[tuple[DexFile, MethodCode]],
+    code_methods: set[str],
+    supertypes: dict[str, set[str]],
+) -> list[dict]:
+    """Resolve concrete Runnable objects handed to scheduling APIs.
+
+    The object must be allocated in the same method/register, implement
+    java.lang.Runnable in the parsed hierarchy, and expose run()V in the APK.
+    """
+    cache: dict[tuple[str, str], bool] = {}
+    edges: list[dict] = []
+    for dex, code in code_records:
+        concrete_by_reg: dict[int, str] = {}
+        for record in _decode_dispatch_records(dex, code):
+            kind = record.get("kind")
+            if kind == "new-instance":
+                register = record.get("register")
+                type_name = record.get("type")
+                if isinstance(register, int) and isinstance(type_name, str):
+                    concrete_by_reg[register] = type_name
+                continue
+            if kind != "invoke":
+                continue
+            for param, register in _invoke_argument_registers(record):
+                if param != "Ljava/lang/Runnable;":
+                    continue
+                concrete = concrete_by_reg.get(register)
+                if not concrete:
+                    continue
+                if not _is_subtype(concrete, "Ljava/lang/Runnable;", supertypes, cache):
+                    continue
+                run_method = concrete + "->run()V"
+                if run_method not in code_methods:
+                    continue
+                caller = code.method.full_name
+                if run_method in graph.setdefault(caller, set()):
+                    continue
+                graph[caller].add(run_method)
+                edges.append({
+                    "caller": caller,
+                    "scheduler": record.get("method"),
+                    "runnable_type": concrete,
+                    "run_method": run_method,
+                    "evidence": (
+                        "same-method concrete new-instance passed as Runnable; "
+                        "type hierarchy confirms Runnable"
+                    ),
+                })
+    return sorted(edges, key=lambda x: (x["caller"], x["scheduler"], x["run_method"]))
+
+
 def _signed16(value: int) -> int:
     return value - 0x10000 if value & 0x8000 else value
+
+
+def _signed32(low: int, high: int) -> int:
+    value = low | (high << 16)
+    return value - 0x100000000 if value & 0x80000000 else value
+
+
+def _switch_cases(units: list[int], switch_offset: int, opcode: int) -> dict[int, int]:
+    if switch_offset + 2 >= len(units):
+        return {}
+    payload_offset = switch_offset + _signed32(
+        units[switch_offset + 1], units[switch_offset + 2]
+    )
+    if payload_offset < 0 or payload_offset + 2 > len(units):
+        return {}
+    ident = units[payload_offset]
+    size = units[payload_offset + 1]
+    cases: dict[int, int] = {}
+
+    if opcode == 0x2B and ident == 0x0100:
+        if payload_offset + 4 + size * 2 > len(units):
+            return {}
+        first_key = _signed32(units[payload_offset + 2], units[payload_offset + 3])
+        targets_off = payload_offset + 4
+        for index in range(size):
+            rel = _signed32(
+                units[targets_off + index * 2],
+                units[targets_off + index * 2 + 1],
+            )
+            cases[first_key + index] = switch_offset + rel
+    elif opcode == 0x2C and ident == 0x0200:
+        keys_off = payload_offset + 2
+        targets_off = keys_off + size * 2
+        if targets_off + size * 2 > len(units):
+            return {}
+        for index in range(size):
+            key = _signed32(
+                units[keys_off + index * 2],
+                units[keys_off + index * 2 + 1],
+            )
+            rel = _signed32(
+                units[targets_off + index * 2],
+                units[targets_off + index * 2 + 1],
+            )
+            cases[key] = switch_offset + rel
+    return cases
 
 
 def _invoke_registers(units: list[int], index: int, opcode: int) -> list[int]:
@@ -496,6 +636,43 @@ def _decode_dispatch_records(dex: DexFile, code: MethodCode) -> list[dict]:
                 register=(units[i] >> 8) & 0xFF,
                 string_index=units[i + 1] | (units[i + 2] << 16),
             )
+        elif opcode == 0x12:
+            register = (units[i] >> 8) & 0xF
+            literal = (units[i] >> 12) & 0xF
+            if literal & 0x8:
+                literal -= 0x10
+            record.update(kind="const-int", register=register, value=literal)
+        elif opcode == 0x13 and i + 1 < len(units):
+            record.update(
+                kind="const-int",
+                register=(units[i] >> 8) & 0xFF,
+                value=_signed16(units[i + 1]),
+            )
+        elif opcode == 0x14 and i + 2 < len(units):
+            record.update(
+                kind="const-int",
+                register=(units[i] >> 8) & 0xFF,
+                value=_signed32(units[i + 1], units[i + 2]),
+            )
+        elif opcode in {0x28, 0x29, 0x2A}:
+            if opcode == 0x28:
+                rel = (units[i] >> 8) & 0xFF
+                if rel & 0x80:
+                    rel -= 0x100
+            elif opcode == 0x29 and i + 1 < len(units):
+                rel = _signed16(units[i + 1])
+            elif opcode == 0x2A and i + 2 < len(units):
+                rel = _signed32(units[i + 1], units[i + 2])
+            else:
+                rel = 0
+            record.update(kind="goto", target=i + rel)
+        elif opcode in {0x2B, 0x2C} and i + 2 < len(units):
+            record.update(
+                kind="switch",
+                register=(units[i] >> 8) & 0xFF,
+                switch_kind="packed" if opcode == 0x2B else "sparse",
+                cases=_switch_cases(units, i, opcode),
+            )
         elif opcode == 0x22 and i + 1 < len(units):
             type_index = units[i + 1]
             if type_index < len(dex.types):
@@ -527,6 +704,70 @@ def _discover_dispatches_in_method(dex: DexFile, code: MethodCode) -> list[dict]
     records = _decode_dispatch_records(dex, code)
     command_names = {command.lower(): command for command in COMMAND_HINTS}
     discoveries: list[dict] = []
+    offset_to_pos = {record["offset"]: pos for pos, record in enumerate(records)}
+
+    def find_concrete_task_from_switch(branch: dict) -> tuple[list[str], dict | None]:
+        if branch.get("condition") == "nez":
+            success_offset = branch.get("target")
+        else:
+            success_offset = branch.get("offset", 0) + branch.get("width", 0)
+        success_pos = offset_to_pos.get(success_offset)
+        if success_pos is None:
+            return [], None
+
+        discriminant = None
+        discriminant_reg = None
+        search_end = min(len(records), success_pos + 6)
+        for k in range(success_pos, search_end):
+            candidate = records[k]
+            if candidate.get("kind") == "const-int":
+                discriminant = candidate.get("value")
+                discriminant_reg = candidate.get("register")
+                break
+        if not isinstance(discriminant, int) or not isinstance(discriminant_reg, int):
+            return [], None
+
+        switch_record = None
+        goto_target = None
+        for k in range(success_pos, search_end):
+            candidate = records[k]
+            if candidate.get("kind") == "goto":
+                goto_target = candidate.get("target")
+                break
+        if isinstance(goto_target, int):
+            candidate_pos = offset_to_pos.get(goto_target)
+            if candidate_pos is not None and records[candidate_pos].get("kind") == "switch":
+                candidate = records[candidate_pos]
+                if candidate.get("register") == discriminant_reg:
+                    switch_record = candidate
+
+        if switch_record is None:
+            for candidate in records[success_pos:]:
+                if (
+                    candidate.get("kind") == "switch"
+                    and candidate.get("register") == discriminant_reg
+                ):
+                    switch_record = candidate
+                    break
+        if switch_record is None:
+            return [], None
+
+        target = switch_record.get("cases", {}).get(discriminant)
+        if not isinstance(target, int):
+            return [], switch_record
+        target_pos = offset_to_pos.get(target)
+        if target_pos is None:
+            return [], switch_record
+
+        task_types: list[str] = []
+        for candidate in records[target_pos:min(len(records), target_pos + 8)]:
+            if candidate.get("kind") == "new-instance":
+                type_name = candidate.get("type")
+                if isinstance(type_name, str):
+                    task_types.append(type_name)
+            if candidate.get("kind") == "goto" and candidate is not records[target_pos]:
+                break
+        return sorted(set(task_types)), switch_record
 
     for pos, record in enumerate(records):
         if record.get("kind") != "const-string":
@@ -548,8 +789,10 @@ def _discover_dispatches_in_method(dex: DexFile, code: MethodCode) -> list[dict]
             method = candidate.get("method", "")
             regs = candidate.get("registers", [])
             if (
-                (method.startswith("Ljava/lang/String;->equals(") or
-                 method.startswith("Ljava/lang/String;->equalsIgnoreCase("))
+                (
+                    method.startswith("Ljava/lang/String;->equals(")
+                    or method.startswith("Ljava/lang/String;->equalsIgnoreCase(")
+                )
                 and command_reg in regs
             ):
                 invoke_pos = j
@@ -572,6 +815,8 @@ def _discover_dispatches_in_method(dex: DexFile, code: MethodCode) -> list[dict]
         success_start = branch["offset"] + branch["width"]
         success_end = branch["target"] if branch["condition"] == "eqz" else None
         task_types: list[str] = []
+        resolution = "direct-branch"
+        switch_record = None
 
         if success_end is not None and success_end > success_start:
             for candidate in records:
@@ -582,6 +827,11 @@ def _discover_dispatches_in_method(dex: DexFile, code: MethodCode) -> list[dict]
                     if isinstance(type_name, str):
                         task_types.append(type_name)
 
+        if not task_types:
+            task_types, switch_record = find_concrete_task_from_switch(branch)
+            if task_types:
+                resolution = "string-switch"
+
         discoveries.append({
             "command": command,
             "dispatcher": code.method.full_name,
@@ -590,14 +840,19 @@ def _discover_dispatches_in_method(dex: DexFile, code: MethodCode) -> list[dict]
             "branch_target_code_unit": branch["target"],
             "task_types": sorted(set(task_types)),
             "confidence": "high" if task_types else "partial",
+            "resolution": resolution if task_types else "unresolved",
+            "switch_kind": switch_record.get("switch_kind") if switch_record else None,
             "evidence_note": (
-                "command const-string feeds String.equals; matching branch contains concrete new-instance"
-                if task_types else
-                "command comparison identified, but concrete task construction was not resolved"
+                "command const-string feeds String.equals; discriminant and switch case "
+                "resolve to concrete new-instance"
+                if resolution == "string-switch" and task_types
+                else "command const-string feeds String.equals; matching branch contains "
+                     "concrete new-instance"
+                if task_types
+                else "command comparison identified, but concrete task construction was not resolved"
             ),
         })
     return discoveries
-
 
 def _discover_task_dispatches(dexes: list[DexFile]) -> list[dict]:
     discoveries: list[dict] = []
@@ -669,10 +924,14 @@ def trace_apk(
                     graph[caller].add(dex.methods[callee_idx].full_name)
             code_records.append((dex, code))
 
+    code_method_names = {code.method.full_name for _, code in code_records}
     polymorphic_edges_added = _add_polymorphic_edges(
         graph,
-        {code.method.full_name for _, code in code_records},
+        code_method_names,
         supertypes,
+    )
+    runnable_dispatch_edges = _add_runnable_dispatch_edges(
+        graph, code_records, code_method_names, supertypes
     )
     task_dispatches = _discover_task_dispatches(dexes)
 
@@ -696,7 +955,6 @@ def trace_apk(
             })
 
     task_execute_paths: list[dict] = []
-    code_method_names = {code.method.full_name for _, code in code_records}
     for dispatch in task_dispatches:
         for task_type in dispatch["task_types"]:
             execute_candidates = sorted(
@@ -735,6 +993,8 @@ def trace_apk(
         "unique_method_signature_count": len(unique_method_refs),
         "methods_with_code_count": len(code_records),
         "polymorphic_edges_added": polymorphic_edges_added,
+        "runnable_dispatch_edges_added": len(runnable_dispatch_edges),
+        "runnable_dispatch_edges": runnable_dispatch_edges,
         "first_party_prefixes": list(first_party_prefixes),
         "evidence_semantics": {
             "call_edge": "STATIC_CONFIRMED invocation reference; does not prove runtime execution",
@@ -742,7 +1002,8 @@ def trace_apk(
             "sink_path": "shortest static invoke path from command-seed method to privileged sink",
             "cross_dex": "method references are canonicalized by full Dalvik signature across DEX files",
             "polymorphic_dispatch": "known app class/interface relationships add synthetic static dispatch edges",
-            "task_dispatch": "high-confidence mappings require const-string -> String.equals -> matching branch -> concrete new-instance",
+            "runnable_dispatch": "concrete same-method Runnable allocation passed to a scheduling API adds a static edge to that concrete run() implementation",
+            "task_dispatch": "high-confidence mappings resolve either a direct equals branch or a two-stage Java/D8 string-switch to a concrete new-instance",
         },
         "task_dispatches": task_dispatches,
         "task_execute_paths": task_execute_paths,
