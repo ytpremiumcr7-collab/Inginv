@@ -39,3 +39,19 @@ jobs:
       - run: python -m pip install -e .
       - name: Block unreviewed secrets and raw forensic evidence
         run: python -m inginv repo-guard . --history
+
+  source-snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Upload source snapshot for authorized offline verification
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: inginv-source-${{ github.sha }}
+          path: |
+            pyproject.toml
+            src/
+            tests/
+            .inginv/
+          if-no-files-found: error
+          retention-days: 1
