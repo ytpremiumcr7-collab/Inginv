@@ -14,24 +14,24 @@ FORBIDDEN_SUFFIXES = {
     ".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".mov",
 }
 FORBIDDEN_BASENAME_RE = re.compile(
-    r"(?i)(?:_FULL_REPORT|_ACTIVE_REPORT|^logcat(?:_|\\.)|^getprop(?:_|\\.)|^tcp(?:_|\\.))"
+    r"(?i)(?:_FULL_REPORT|_ACTIVE_REPORT|^logcat(?:_|\.)|^getprop(?:_|\.)|^tcp(?:_|\.))"
 )
 
 TOKEN_RULES = (
-    ("GH_TOKEN", "critical", re.compile(r"\\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})\\b")),
-    ("AWS_ACCESS_KEY", "critical", re.compile(r"\\b(?:AKIA|ASIA)[A-Z0-9]{16}\\b")),
-    ("GOOGLE_API_KEY", "critical", re.compile(r"\\bAIza[0-9A-Za-z_-]{35}\\b")),
-    ("SLACK_TOKEN", "critical", re.compile(r"\\bxox[baprs]-[A-Za-z0-9-]{20,}\\b")),
-    ("JWT", "high", re.compile(r"\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\b")),
+    ("GH_TOKEN", "critical", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})\b")),
+    ("AWS_ACCESS_KEY", "critical", re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")),
+    ("GOOGLE_API_KEY", "critical", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
+    ("SLACK_TOKEN", "critical", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b")),
+    ("JWT", "high", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")),
 )
 CREDENTIAL_ASSIGNMENT_RE = re.compile(
-    r"""(?ix)\\b(password|passwd|pwd|secret|token|access[_-]?token|refresh[_-]?token|
-    api[_-]?key|authorization|client[_-]?secret|username|user|session|cookie)\\b
-    \\s*[:=]\\s*["']?([^\\s"'\`,;&]{3,})["']?"""
+    r"""(?ix)\b(password|passwd|pwd|secret|token|access[_-]?token|refresh[_-]?token|
+    api[_-]?key|authorization|client[_-]?secret|username|user|session|cookie)\b
+    \s*[:=]\s*["']?([^\s"'\`,;&]{3,})["']?"""
 )
-SERIAL_RE = re.compile(r"(?i)\\bro\\.serialno\\b\\s*[:=]\\s*\\S+")
-SSID_RE = re.compile(r'(?i)\\bSSID\\s*[:=]\\s*"[^"]+"')
-BSSID_RE = re.compile(r"(?i)\\bBSSID\\s*[:=]\\s*(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\\b")
+SERIAL_RE = re.compile(r"(?i)\bro\.serialno\b\s*[:=]\s*\S+")
+SSID_RE = re.compile(r'(?i)\bSSID\s*[:=]\s*"[^"]+"')
+BSSID_RE = re.compile(r"(?i)\bBSSID\s*[:=]\s*(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b")
 SAFE_MARKERS = (
     "<redacted>", "redacted", "example", "dummy", "placeholder",
     "not-a-real", "changeme", "your_", "your-", "${", "{{",
