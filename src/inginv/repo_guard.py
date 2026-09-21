@@ -27,8 +27,9 @@ TOKEN_RULES = (
     ("JWT", "high", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")),
 )
 CREDENTIAL_ASSIGNMENT_RE = re.compile(
-    r"""(?ix)\b(password|passwd|pwd|secret|token|api[_-]?key|authorization|client[_-]?secret)\b
-    \s*[:=]\s*["']?([^\s"'`,;]{8,})["']?"""
+    r"""(?ix)\b(password|passwd|pwd|secret|token|access[_-]?token|refresh[_-]?token|
+    api[_-]?key|authorization|client[_-]?secret|username|user|session|cookie)\b
+    \s*[:=]\s*["']?([^\s"'\`,;&]{3,})["']?"""
 )
 SERIAL_RE = re.compile(r"(?i)\bro\.serialno\b\s*[:=]\s*\S+")
 SSID_RE = re.compile(r'(?i)\bSSID\s*[:=]\s*"[^"]+"')
